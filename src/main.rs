@@ -3,6 +3,7 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+pub mod image;
 mod kiro;
 mod model;
 pub mod token;
@@ -17,6 +18,7 @@ use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
+use parking_lot::RwLock;
 
 #[tokio::main]
 async fn main() {
@@ -157,11 +159,15 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 共享压缩配置（admin API 可运行时修改）
+    let compression_config = Arc::new(RwLock::new(config.compression.clone()));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        compression_config.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -179,7 +185,7 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

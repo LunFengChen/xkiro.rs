@@ -9,10 +9,12 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use crate::common::auth;
+use crate::model::config::CompressionConfig;
 
 /// Admin API 共享状态
 #[derive(Clone)]
@@ -21,13 +23,20 @@ pub struct AdminState {
     pub admin_api_key: String,
     /// Admin 服务
     pub service: Arc<AdminService>,
+    /// 共享压缩配置（运行时可修改）
+    pub compression_config: Arc<RwLock<CompressionConfig>>,
 }
 
 impl AdminState {
-    pub fn new(admin_api_key: impl Into<String>, service: AdminService) -> Self {
+    pub fn new(
+        admin_api_key: impl Into<String>,
+        service: AdminService,
+        compression_config: Arc<RwLock<CompressionConfig>>,
+    ) -> Self {
         Self {
             admin_api_key: admin_api_key.into(),
             service: Arc::new(service),
+            compression_config,
         }
     }
 }

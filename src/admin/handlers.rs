@@ -13,6 +13,7 @@ use super::{
         SuccessResponse,
     },
 };
+use crate::model::config::CompressionConfig;
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -139,4 +140,22 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/config/compression
+/// 获取压缩配置
+pub async fn get_compression_config(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = state.compression_config.read().clone();
+    Json(config)
+}
+
+/// PUT /api/admin/config/compression
+/// 更新压缩配置
+pub async fn set_compression_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<CompressionConfig>,
+) -> impl IntoResponse {
+    *state.compression_config.write() = payload.clone();
+    tracing::info!("压缩配置已通过 Admin API 更新");
+    Json(payload)
 }

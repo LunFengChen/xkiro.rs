@@ -23,10 +23,12 @@
 //! ```
 
 mod converter;
+pub mod compressor;
 mod handlers;
 mod middleware;
 mod router;
 mod stream;
+pub mod tool_compression;
 pub mod types;
 mod websearch;
 

@@ -17,6 +17,100 @@ impl Default for TlsBackend {
     }
 }
 
+/// 压缩配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub whitespace_compression: bool,
+    #[serde(default = "default_thinking_strategy")]
+    pub thinking_strategy: String,
+    #[serde(default = "default_8000")]
+    pub tool_result_max_chars: usize,
+    #[serde(default = "default_80")]
+    pub tool_result_head_lines: usize,
+    #[serde(default = "default_40")]
+    pub tool_result_tail_lines: usize,
+    #[serde(default = "default_6000")]
+    pub tool_use_input_max_chars: usize,
+    #[serde(default = "default_4000")]
+    pub tool_description_max_chars: usize,
+    #[serde(default = "default_80_turns")]
+    pub max_history_turns: usize,
+    #[serde(default = "default_400k")]
+    pub max_history_chars: usize,
+    #[serde(default = "default_image_max_long_edge")]
+    pub image_max_long_edge: u32,
+    #[serde(default = "default_image_max_pixels_single")]
+    pub image_max_pixels_single: u32,
+    #[serde(default = "default_image_max_pixels_multi")]
+    pub image_max_pixels_multi: u32,
+    #[serde(default = "default_image_multi_threshold")]
+    pub image_multi_threshold: usize,
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    #[serde(default = "default_6")]
+    pub stale_tool_result_clear_turns: usize,
+    #[serde(default = "default_true")]
+    pub shell_pattern_filter: bool,
+    #[serde(default = "default_true")]
+    pub dedup_enabled: bool,
+    #[serde(default = "default_200")]
+    pub dedup_min_chars: usize,
+    #[serde(default = "default_tool_compression_level")]
+    pub tool_compression_level: String,
+    #[serde(default = "default_true")]
+    pub truncation_summary_header: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            whitespace_compression: true,
+            thinking_strategy: default_thinking_strategy(),
+            tool_result_max_chars: default_8000(),
+            tool_result_head_lines: default_80(),
+            tool_result_tail_lines: default_40(),
+            tool_use_input_max_chars: default_6000(),
+            tool_description_max_chars: default_4000(),
+            max_history_turns: default_80_turns(),
+            max_history_chars: default_400k(),
+            image_max_long_edge: default_image_max_long_edge(),
+            image_max_pixels_single: default_image_max_pixels_single(),
+            image_max_pixels_multi: default_image_max_pixels_multi(),
+            image_multi_threshold: default_image_multi_threshold(),
+            max_request_body_bytes: default_max_request_body_bytes(),
+            stale_tool_result_clear_turns: default_6(),
+            shell_pattern_filter: true,
+            dedup_enabled: true,
+            dedup_min_chars: default_200(),
+            tool_compression_level: default_tool_compression_level(),
+            truncation_summary_header: true,
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+fn default_thinking_strategy() -> String { "discard".to_string() }
+fn default_8000() -> usize { 8000 }
+fn default_80() -> usize { 80 }
+fn default_40() -> usize { 40 }
+fn default_6000() -> usize { 6000 }
+fn default_4000() -> usize { 4000 }
+fn default_80_turns() -> usize { 80 }
+fn default_400k() -> usize { 400_000 }
+fn default_6() -> usize { 6 }
+fn default_200() -> usize { 200 }
+fn default_tool_compression_level() -> String { "auto".to_string() }
+fn default_image_max_long_edge() -> u32 { 4000 }
+fn default_image_max_pixels_single() -> u32 { 4_000_000 }
+fn default_image_max_pixels_multi() -> u32 { 4_000_000 }
+fn default_image_multi_threshold() -> usize { 20 }
+fn default_max_request_body_bytes() -> usize { 4_718_592 }
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +203,10 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 压缩配置
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -184,6 +282,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            compression: CompressionConfig::default(),
             config_path: None,
         }
     }

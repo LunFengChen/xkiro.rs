@@ -9,9 +9,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::CompressionConfig;
 
 use super::types::ErrorResponse;
 
@@ -25,6 +27,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 共享压缩配置（运行时可修改）
+    pub compression: Arc<RwLock<CompressionConfig>>,
 }
 
 impl AppState {
@@ -34,12 +38,19 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            compression: Arc::new(RwLock::new(CompressionConfig::default())),
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置压缩配置
+    pub fn with_compression(mut self, compression: Arc<RwLock<CompressionConfig>>) -> Self {
+        self.compression = compression;
         self
     }
 }

@@ -221,7 +221,8 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let compression = state.compression.read().clone();
+    let conversion_result = match convert_request(&payload, &compression) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -242,8 +243,16 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let mut conversation_state = conversion_result.conversation_state;
+
+    // 多层压缩
+    if compression.enabled {
+        let stats = super::compressor::compress(&mut conversation_state, &compression);
+        tracing::debug!("压缩统计: {:?}", stats);
+    }
+
     let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
+        conversation_state,
         profile_arn: None,
     };
 
@@ -734,7 +743,8 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let compression = state.compression.read().clone();
+    let conversion_result = match convert_request(&payload, &compression) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -755,8 +765,16 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let mut conversation_state = conversion_result.conversation_state;
+
+    // 多层压缩
+    if compression.enabled {
+        let stats = super::compressor::compress(&mut conversation_state, &compression);
+        tracing::debug!("压缩统计: {:?}", stats);
+    }
+
     let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
+        conversation_state,
         profile_arn: None,
     };
 

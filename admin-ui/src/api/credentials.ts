@@ -104,3 +104,40 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
   return data
 }
+
+// 压缩配置类型
+export interface CompressionConfig {
+  enabled: boolean
+  whitespaceCompression: boolean
+  thinkingStrategy: string
+  toolResultMaxChars: number
+  toolResultHeadLines: number
+  toolResultTailLines: number
+  toolUseInputMaxChars: number
+  toolDescriptionMaxChars: number
+  maxHistoryTurns: number
+  maxHistoryChars: number
+  imageMaxLongEdge: number
+  imageMaxPixelsSingle: number
+  imageMaxPixelsMulti: number
+  imageMultiThreshold: number
+  maxRequestBodyBytes: number
+  staleToolResultClearTurns: number
+  shellPatternFilter: boolean
+  dedupEnabled: boolean
+  dedupMinChars: number
+  toolCompressionLevel: string
+  truncationSummaryHeader: boolean
+}
+
+// 获取压缩配置
+export async function getCompressionConfig(): Promise<CompressionConfig> {
+  const { data } = await api.get<CompressionConfig>('/config/compression')
+  return data
+}
+
+// 更新压缩配置
+export async function setCompressionConfig(config: CompressionConfig): Promise<CompressionConfig> {
+  const { data } = await api.put<CompressionConfig>('/config/compression', config)
+  return data
+}

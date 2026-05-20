@@ -14,7 +14,9 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::CompressionConfig;
 
+use super::tool_compression;
 use super::types::{ContentBlock, MessagesRequest};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -216,7 +218,10 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    compression_config: &CompressionConfig,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -255,14 +260,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, tool_results) =
+        process_message_content(&last_message.content, compression_config, 0)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, compression_config)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -287,6 +293,9 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
+
+    // 11.5. 工具定义分级压缩
+    let tools = tool_compression::compress_tools_if_needed(&tools, &compression_config.tool_compression_level);
 
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
@@ -341,6 +350,8 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
+    compression_config: &CompressionConfig,
+    image_count_hint: usize,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -362,7 +373,62 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                    if compression_config.enabled && format == "gif" {
+                                        match crate::image::process_gif_frames(
+                                            &source.data,
+                                            compression_config,
+                                            image_count_hint,
+                                            20,
+                                        ) {
+                                            Ok(result) => {
+                                                for frame in result.frames {
+                                                    images.push(KiroImage::from_base64(
+                                                        result.output_format,
+                                                        frame.data,
+                                                    ));
+                                                }
+                                            }
+                                            Err(_) => {
+                                                match crate::image::process_image(
+                                                    &source.data,
+                                                    &format,
+                                                    compression_config,
+                                                    image_count_hint,
+                                                ) {
+                                                    Ok(result) => {
+                                                        images.push(KiroImage::from_base64(
+                                                            format, result.data,
+                                                        ));
+                                                    }
+                                                    Err(_) => {
+                                                        images.push(KiroImage::from_base64(
+                                                            format, source.data,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if compression_config.enabled {
+                                        match crate::image::process_image(
+                                            &source.data,
+                                            &format,
+                                            compression_config,
+                                            image_count_hint,
+                                        ) {
+                                            Ok(result) => {
+                                                images.push(KiroImage::from_base64(
+                                                    format, result.data,
+                                                ));
+                                            }
+                                            Err(_) => {
+                                                images.push(KiroImage::from_base64(
+                                                    format, source.data,
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        images.push(KiroImage::from_base64(format, source.data));
+                                    }
                                 }
                             }
                         }
@@ -648,7 +714,7 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>, compression_config: &CompressionConfig) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -716,7 +782,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, compression_config)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -733,7 +799,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, compression_config)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -748,13 +814,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    compression_config: &CompressionConfig,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) = process_message_content(&msg.content, compression_config, 0)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1091,7 +1158,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
 
         // 应该有映射
         assert_eq!(result.tool_name_map.len(), 1);
@@ -1154,7 +1221,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
         // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -1211,7 +1278,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1299,7 +1366,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1327,7 +1394,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -1757,7 +1824,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req);
+        let result = convert_request(&req, &CompressionConfig::default());
         assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
 
         let state = result.unwrap().conversation_state;
