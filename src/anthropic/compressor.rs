@@ -1105,12 +1105,13 @@ fn truncate_long_content(field: &mut String, max_chars: usize) -> usize {
 
 // ============ 工具函数 ============
 
-/// 安全 UTF-8 字符截断
-fn safe_char_truncate(text: &str, max_chars: usize) -> &str {
-    match text.char_indices().nth(max_chars) {
-        Some((idx, _)) => &text[..idx],
-        None => text,
-    }
+/// 安全 grapheme cluster 截断 (UAX #29)
+fn safe_char_truncate(text: &str, max_graphemes: usize) -> &str {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.grapheme_indices(true)
+        .nth(max_graphemes)
+        .map(|(idx, _)| &text[..idx])
+        .unwrap_or(text)
 }
 
 #[cfg(test)]
@@ -1182,6 +1183,24 @@ mod tests {
         let input = "你好世界abcd";
         let result = safe_char_truncate(input, 4);
         assert_eq!(result, "你好世界");
+    }
+
+    #[test]
+    fn test_safe_truncate_grapheme_clusters() {
+        // ZWJ family emoji = 1 grapheme cluster
+        let family = "👨‍👩‍👧‍👦hello";
+        let result = safe_char_truncate(family, 1);
+        assert_eq!(result, "👨‍👩‍👧‍👦");
+
+        // Flag emoji = 1 grapheme cluster (2 regional indicators)
+        let flag = "🇺🇸world";
+        let result = safe_char_truncate(flag, 1);
+        assert_eq!(result, "🇺🇸");
+
+        // Combining character: e + combining acute = 1 grapheme
+        let combining = "e\u{0301}abc";
+        let result = safe_char_truncate(combining, 1);
+        assert_eq!(result, "e\u{0301}");
     }
 
     #[test]

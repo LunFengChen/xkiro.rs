@@ -116,21 +116,22 @@ fn compress_level3(tools: &[KiroTool]) -> Vec<KiroTool> {
 
 /// 按比例截断所有 tool descriptions
 fn truncate_descriptions(tools: &mut [KiroTool], ratio: f64) {
+    use unicode_segmentation::UnicodeSegmentation;
     for tool in tools.iter_mut() {
         let desc = &tool.tool_specification.description;
         let target_bytes = (desc.len() as f64 * ratio) as usize;
         let min_bytes = desc
-            .char_indices()
+            .grapheme_indices(true)
             .nth(MIN_DESCRIPTION_CHARS)
             .map(|(idx, _)| idx)
             .unwrap_or(desc.len());
         let target_bytes = target_bytes.max(min_bytes);
         if desc.len() > target_bytes {
             let truncate_at = desc
-                .char_indices()
+                .grapheme_indices(true)
                 .take_while(|(idx, _)| *idx <= target_bytes)
                 .last()
-                .map(|(idx, ch)| idx + ch.len_utf8())
+                .map(|(idx, g)| idx + g.len())
                 .unwrap_or(0);
             tool.tool_specification.description = desc[..truncate_at].to_string();
         }
