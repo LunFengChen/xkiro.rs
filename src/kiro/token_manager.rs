@@ -1189,6 +1189,7 @@ impl MultiTokenManager {
     }
 
     /// 标记凭据为认证失败（如 invalid_grant，不会被自动恢复）
+    #[allow(dead_code)]
     pub fn mark_authentication_failed(&self, id: u64) {
         {
             let mut entries = self.entries.lock();
@@ -1202,6 +1203,7 @@ impl MultiTokenManager {
     }
 
     /// 标记凭据为账户暂停（不会被自动恢复）
+    #[allow(dead_code)]
     pub fn mark_account_suspended(&self, id: u64) {
         {
             let mut entries = self.entries.lock();
@@ -1231,6 +1233,7 @@ impl MultiTokenManager {
     /// 获取缓存的余额（动态 TTL：低余额 > 高频 > 低频）
     ///
     /// 缓存不存在或已过期时返回 0.0，调用方应回退到优先级选择
+    #[allow(dead_code)]
     fn get_cached_balance(&self, id: u64) -> f64 {
         let cache = self.balance_cache.lock();
         if let Some(entry) = cache.get(&id) {
@@ -1276,6 +1279,7 @@ impl MultiTokenManager {
     /// `cached_at_unix_secs` 为持久化时记录的 Unix 时间戳（秒）。
     /// 系统刚重启或 uptime < age_secs 时，将 cached_at 设为足够旧的时间点，
     /// 确保 TTL 判定视为已过期，下一次调用会触发重新刷新。
+    #[allow(dead_code)]
     pub fn restore_balance_cache(&self, id: u64, remaining: f64, cached_at_unix_secs: f64) {
         let mut cache = self.balance_cache.lock();
         let now_instant = std::time::Instant::now();
@@ -1314,6 +1318,7 @@ impl MultiTokenManager {
     /// 检查是否需要刷新余额缓存
     ///
     /// 未初始化的缓存返回 true 立即触发刷新；已初始化的根据动态 TTL 判断
+    #[allow(dead_code)]
     pub fn should_refresh_balance(&self, id: u64) -> bool {
         let cache = self.balance_cache.lock();
         if let Some(entry) = cache.get(&id) {

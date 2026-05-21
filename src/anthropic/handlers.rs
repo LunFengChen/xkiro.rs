@@ -846,6 +846,12 @@ pub async fn post_messages(
             .await;
     }
 
+    // 混合工具场景：剔除 web_search 后转发上游
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
+        websearch::strip_web_search_tools(&mut payload);
+    }
+
     // 转换请求
     let compression = state.compression_config.read().clone();
     let conversion_result = match convert_request(&payload, &compression) {
@@ -1572,6 +1578,12 @@ pub async fn post_messages_cc(
 
         return websearch::handle_websearch_request(provider, &payload, None, None, input_tokens)
             .await;
+    }
+
+    // 混合工具场景：剔除 web_search 后转发上游
+    if websearch::has_web_search_tool(&payload) {
+        tracing::info!("检测到混合工具列表中的 web_search，剔除后转发上游");
+        websearch::strip_web_search_tools(&mut payload);
     }
 
     // 转换请求
