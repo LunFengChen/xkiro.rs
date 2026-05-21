@@ -82,6 +82,24 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改 region 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRegionRequest {
+    /// 凭据级 Region（用于 Token 刷新），空字符串表示清除
+    pub region: Option<String>,
+    /// 凭据级 API Region（单独覆盖 API 请求），空字符串表示清除
+    pub api_region: Option<String>,
+}
+
+/// 修改 endpoint 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointRequest {
+    /// endpoint 名称，空字符串或 null 表示回退到 defaultEndpoint
+    pub endpoint: Option<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -178,6 +196,34 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+/// 缓存余额信息
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalanceItem {
+    /// 凭据 ID
+    pub id: u64,
+    /// 缓存的剩余额度
+    pub remaining: f64,
+    /// 使用限额
+    pub usage_limit: f64,
+    /// 使用百分比
+    pub usage_percentage: f64,
+    /// 订阅类型
+    pub subscription_title: Option<String>,
+    /// 缓存时间（Unix 毫秒时间戳）
+    pub cached_at: u64,
+    /// 缓存存活时间（秒），缓存过期时间 = cached_at + ttl_secs * 1000
+    pub ttl_secs: u64,
+}
+
+/// 所有凭据的缓存余额响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalancesResponse {
+    /// 各凭据的缓存余额列表
+    pub balances: Vec<CachedBalanceItem>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应
@@ -194,6 +240,193 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 全局代理配置 ============
+
+/// 全局代理配置响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfigResponse {
+    pub proxy_url: Option<String>,
+    pub has_credentials: bool,
+}
+
+/// 更新全局代理配置请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyConfigRequest {
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+// ============ 全局配置 ============
+
+/// 全局配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalConfigResponse {
+    /// AWS Region
+    pub region: String,
+    /// Prompt Cache TTL（秒）
+    pub prompt_cache_ttl_seconds: u64,
+    /// 是否启用本地 Prompt Cache usage 记账
+    pub prompt_cache_accounting_enabled: bool,
+    /// 默认端点名称（凭据未显式指定 endpoint 时使用）
+    pub default_endpoint: String,
+    /// 是否开启非流式响应的 thinking 块提取
+    pub extract_thinking: bool,
+    /// 压缩配置
+    pub compression: CompressionConfigResponse,
+}
+
+/// 压缩配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfigResponse {
+    pub enabled: bool,
+    pub whitespace_compression: bool,
+    pub thinking_strategy: String,
+    pub tool_result_max_chars: usize,
+    pub tool_result_head_lines: usize,
+    pub tool_result_tail_lines: usize,
+    pub tool_use_input_max_chars: usize,
+    pub tool_description_max_chars: usize,
+    pub max_history_turns: usize,
+    pub max_history_chars: usize,
+    pub image_max_long_edge: u32,
+    pub image_max_pixels_single: u32,
+    pub image_max_pixels_multi: u32,
+    pub image_multi_threshold: usize,
+    pub max_request_body_bytes: usize,
+}
+
+/// 更新全局配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGlobalConfigRequest {
+    /// AWS Region（可选）
+    pub region: Option<String>,
+    /// Prompt Cache TTL（秒，可选，仅支持 300 或 3600）
+    pub prompt_cache_ttl_seconds: Option<u64>,
+    /// 是否启用本地 Prompt Cache usage 记账（可选）
+    pub prompt_cache_accounting_enabled: Option<bool>,
+    /// 默认端点名称（可选）
+    pub default_endpoint: Option<String>,
+    /// 是否开启非流式响应的 thinking 块提取（可选）
+    pub extract_thinking: Option<bool>,
+    /// 压缩配置（可选）
+    pub compression: Option<UpdateCompressionConfigRequest>,
+}
+
+/// 更新压缩配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCompressionConfigRequest {
+    pub enabled: Option<bool>,
+    pub whitespace_compression: Option<bool>,
+    pub thinking_strategy: Option<String>,
+    pub tool_result_max_chars: Option<usize>,
+    pub tool_result_head_lines: Option<usize>,
+    pub tool_result_tail_lines: Option<usize>,
+    pub tool_use_input_max_chars: Option<usize>,
+    pub tool_description_max_chars: Option<usize>,
+    pub max_history_turns: Option<usize>,
+    pub max_history_chars: Option<usize>,
+    pub image_max_long_edge: Option<u32>,
+    pub image_max_pixels_single: Option<u32>,
+    pub image_max_pixels_multi: Option<u32>,
+    pub image_multi_threshold: Option<usize>,
+    pub max_request_body_bytes: Option<usize>,
+}
+
+// ============ 批量导入 token.json ============
+
+/// 官方 token.json 格式（用于解析导入）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenJsonItem {
+    pub provider: Option<String>,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub auth_method: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    pub region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+}
+
+/// 批量导入请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonRequest {
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+    pub items: ImportItems,
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+/// 导入项（支持单个或数组）
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ImportItems {
+    Single(TokenJsonItem),
+    Multiple(Vec<TokenJsonItem>),
+}
+
+impl ImportItems {
+    pub fn into_vec(self) -> Vec<TokenJsonItem> {
+        match self {
+            ImportItems::Single(item) => vec![item],
+            ImportItems::Multiple(items) => items,
+        }
+    }
+}
+
+/// 批量导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportTokenJsonResponse {
+    pub summary: ImportSummary,
+    pub items: Vec<ImportItemResult>,
+}
+
+/// 导入汇总
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub parsed: usize,
+    pub added: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+}
+
+/// 单项导入结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportItemResult {
+    pub index: usize,
+    pub fingerprint: String,
+    pub action: ImportAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+}
+
+/// 导入动作
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportAction {
+    Added,
+    Skipped,
+    Invalid,
 }
 
 // ============ 通用响应 ============
