@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetEndpointRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
+        UpdateProxyConfigRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -158,4 +159,73 @@ pub async fn set_compression_config(
     *state.compression_config.write() = payload.clone();
     tracing::info!("压缩配置已通过 Admin API 更新");
     Json(payload)
+}
+
+/// POST /api/admin/credentials/:id/region
+/// 设置凭据 Region
+pub async fn set_credential_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRegionRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_region(id, payload.region, payload.api_region)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} Region 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/endpoint
+/// 设置凭据 endpoint
+pub async fn set_credential_endpoint(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetEndpointRequest>,
+) -> impl IntoResponse {
+    match state.service.set_endpoint(id, payload.endpoint) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} endpoint 已更新",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy
+/// 获取全局代理配置（脱敏）
+pub async fn get_proxy_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_config())
+}
+
+/// POST /api/admin/proxy
+/// 更新全局代理配置（热更新）
+pub async fn update_proxy_config(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateProxyConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_config(req).await {
+        Ok(_) => Json(SuccessResponse::new("全局代理配置已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/global
+/// 获取全局配置
+pub async fn get_global_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_global_config())
+}
+
+/// PUT /api/admin/config/global
+/// 更新全局配置（热更新）
+pub async fn update_global_config(
+    State(state): State<AdminState>,
+    Json(req): Json<UpdateGlobalConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_global_config(req).await {
+        Ok(_) => Json(SuccessResponse::new("全局配置已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
