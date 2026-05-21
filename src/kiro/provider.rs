@@ -244,6 +244,15 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                if Self::is_input_too_long(&body) {
+                    tracing::error!(
+                        status = %status,
+                        response_body_bytes = body.len(),
+                        request_url = %url,
+                        request_body_bytes = request_body.len(),
+                        "MCP 400 Bad Request - 输入上下文过长"
+                    );
+                }
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -277,6 +286,16 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 检测 MODEL_TEMPORARILY_UNAVAILABLE 并触发全局熔断
+                if Self::is_model_temporarily_unavailable(&body)
+                    && self.token_manager.report_model_unavailable()
+                {
+                    anyhow::bail!(
+                        "MCP 请求失败（模型暂时不可用，已触发熔断）: {} {}",
+                        status,
+                        body
+                    );
+                }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -430,6 +449,17 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                if Self::is_input_too_long(&body) {
+                    tracing::error!(
+                        api_type = %api_type,
+                        status = %status,
+                        response_body_bytes = body.len(),
+                        request_url = %url,
+                        request_body_bytes = request_body.len(),
+                        "{} API 400 Bad Request - 输入上下文过长",
+                        api_type
+                    );
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -483,6 +513,17 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 检测 MODEL_TEMPORARILY_UNAVAILABLE 并触发全局熔断
+                if Self::is_model_temporarily_unavailable(&body)
+                    && self.token_manager.report_model_unavailable()
+                {
+                    anyhow::bail!(
+                        "{} API 请求失败（模型暂时不可用，已触发熔断）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
@@ -545,6 +586,41 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 检测响应体是否表示「模型暂时不可用」
+    ///
+    /// 对齐 BK：识别 `MODEL_TEMPORARILY_UNAVAILABLE` 字符串、顶层 `reason` 字段，
+    /// 以及 `error.reason` 嵌套字段。命中后由调用方决定是否触发全局熔断。
+    fn is_model_temporarily_unavailable(body: &str) -> bool {
+        if body.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        if value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
+        {
+            return true;
+        }
+
+        value
+            .pointer("/error/reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
+    }
+
+    /// 检测响应体是否表示「输入过长」
+    ///
+    /// 对齐 BK：典型返回
+    /// `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`
+    fn is_input_too_long(body: &str) -> bool {
+        body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || body.contains("Input is too long")
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -554,5 +630,53 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KiroProvider;
+
+    #[test]
+    fn detects_model_temporarily_unavailable_substring() {
+        let body = r#"{"message":"Improperly formed request.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#;
+        assert!(KiroProvider::is_model_temporarily_unavailable(body));
+    }
+
+    #[test]
+    fn detects_model_temporarily_unavailable_top_level() {
+        let body = r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#;
+        assert!(KiroProvider::is_model_temporarily_unavailable(body));
+    }
+
+    #[test]
+    fn detects_model_temporarily_unavailable_nested_error() {
+        let body = r#"{"error":{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#;
+        assert!(KiroProvider::is_model_temporarily_unavailable(body));
+    }
+
+    #[test]
+    fn does_not_match_other_reasons() {
+        let body = r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert!(!KiroProvider::is_model_temporarily_unavailable(body));
+    }
+
+    #[test]
+    fn detects_input_too_long_by_reason() {
+        let body =
+            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        assert!(KiroProvider::is_input_too_long(body));
+    }
+
+    #[test]
+    fn detects_input_too_long_by_message() {
+        let body = r#"{"message":"Input is too long for requested model"}"#;
+        assert!(KiroProvider::is_input_too_long(body));
+    }
+
+    #[test]
+    fn input_too_long_does_not_match_unrelated() {
+        let body = r#"{"message":"unauthorized"}"#;
+        assert!(!KiroProvider::is_input_too_long(body));
     }
 }
