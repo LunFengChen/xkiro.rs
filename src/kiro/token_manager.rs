@@ -12,7 +12,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -403,6 +403,31 @@ pub(crate) async fn get_usage_limits(
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
+
+/// 解析路径的真实目标（穿透 symlink）。
+///
+/// 用于 `persist_credentials` 的原子写入：保证 rename 替换的是 symlink
+/// 指向的真实文件，而不是 symlink 本身。
+///
+/// 优先 `canonicalize`（目标存在时最可靠），失败时 fallback 到 `read_link`，
+/// 都失败则返回原路径（保持向后兼容）。
+fn resolve_symlink_target(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+
+    if let Ok(target) = std::fs::read_link(path) {
+        if target.is_absolute() {
+            return target;
+        }
+        if let Some(parent) = path.parent() {
+            return parent.join(target);
+        }
+        return target;
+    }
+
+    path.to_path_buf()
+}
 
 /// 单个凭据条目的状态
 struct CredentialEntry {
@@ -1554,12 +1579,42 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
+        // 原子写入：先写临时文件，再 rename 替换目标文件
+        // rename 在同一文件系统上是原子操作，避免进程崩溃导致凭据文件损坏
+        // 解析 symlink 以确保 rename 写入真实目标（而非替换 symlink 本身）
+        let real_path = resolve_symlink_target(path);
+        let tmp_path = real_path.with_extension("json.tmp");
+
+        let do_atomic_write = || -> anyhow::Result<()> {
+            // 尝试保留原文件权限（避免 umask 导致权限放宽）
+            let original_perms = std::fs::metadata(&real_path).ok().map(|m| m.permissions());
+
+            std::fs::write(&tmp_path, &json)
+                .with_context(|| format!("写入临时凭据文件失败: {:?}", tmp_path))?;
+
+            if let Some(perms) = original_perms {
+                // best-effort：权限复制失败不阻塞回写
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
+
+            // 跨平台原子替换：Windows 上 rename 无法覆盖已存在文件，需先删除
+            #[cfg(windows)]
+            if real_path.exists() {
+                std::fs::remove_file(&real_path)
+                    .with_context(|| format!("删除旧凭据文件失败: {:?}", real_path))?;
+            }
+
+            std::fs::rename(&tmp_path, &real_path).with_context(|| {
+                format!("原子替换凭据文件失败: {:?} -> {:?}", tmp_path, real_path)
+            })?;
+            Ok(())
+        };
+
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            tokio::task::block_in_place(do_atomic_write)?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            do_atomic_write()?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
