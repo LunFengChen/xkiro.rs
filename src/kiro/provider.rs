@@ -171,7 +171,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -187,7 +187,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -337,7 +337,7 @@ impl KiroProvider {
             };
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -352,7 +352,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.api_url(&rctx);

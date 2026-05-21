@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
@@ -421,6 +421,7 @@ struct CredentialEntry {
 
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
@@ -434,6 +435,14 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 认证失败（如 invalid_grant 之外的认证错误）
+    AuthenticationFailed,
+    /// 账户被暂停
+    AccountSuspended,
+    /// 余额不足
+    InsufficientBalance,
+    /// 模型临时不可用（全局禁用）
+    ModelUnavailable,
 }
 
 /// 统计数据持久化条目
@@ -506,13 +515,27 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 缓存余额信息（用于 Admin API）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBalanceInfo {
+    /// 凭据 ID
+    pub id: u64,
+    /// 缓存的剩余额度
+    pub remaining: f64,
+    /// 缓存时间（Unix 毫秒时间戳）
+    pub cached_at: u64,
+    /// 缓存存活时间（秒）
+    pub ttl_secs: u64,
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    config: Config,
-    proxy: Option<ProxyConfig>,
+    config: RwLock<Config>,
+    proxy: RwLock<Option<ProxyConfig>>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -651,8 +674,8 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
-            config,
-            proxy,
+            config: RwLock::new(config),
+            proxy: RwLock::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -680,9 +703,24 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// 获取配置的克隆（RwLock 持锁仅瞬时）
+    pub fn config(&self) -> Config {
+        self.config.read().clone()
+    }
+
+    /// 更新全局代理配置（Admin 热更新）
+    pub fn update_proxy(&self, proxy: Option<ProxyConfig>) {
+        *self.proxy.write() = proxy;
+    }
+
+    /// 更新全局默认 region（Admin 热更新）
+    pub fn update_region(&self, region: String) {
+        self.config.write().region = region;
+    }
+
+    /// 更新全局默认 endpoint（Admin 热更新）
+    pub fn update_default_endpoint(&self, default_endpoint: String) {
+        self.config.write().default_endpoint = default_endpoint;
     }
 
     /// 获取凭据总数
@@ -967,9 +1005,11 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let proxy_snap = self.proxy.read().clone();
+                let config_snap = self.config.read().clone();
+                let effective_proxy = current_creds.effective_proxy(proxy_snap.as_ref());
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &config_snap, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1505,6 +1545,10 @@ impl MultiTokenManager {
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::AuthenticationFailed => "AuthenticationFailed",
+                        DisabledReason::AccountSuspended => "AccountSuspended",
+                        DisabledReason::InsufficientBalance => "InsufficientBalance",
+                        DisabledReason::ModelUnavailable => "ModelUnavailable",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                 })
@@ -1582,6 +1626,44 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置指定凭据的 region / api_region 覆盖（Admin API）
+    ///
+    /// 传 `None` 表示清除该字段，回退到全局默认 region。
+    pub fn set_region(
+        &self,
+        id: u64,
+        region: Option<String>,
+        api_region: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.region = region;
+            entry.credentials.api_region = api_region;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置指定凭据的 endpoint 覆盖（Admin API）
+    ///
+    /// 传 `None` 表示清除该字段，回退到全局默认 endpoint。
+    pub fn set_endpoint(&self, id: u64, endpoint: Option<String>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.endpoint = endpoint;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -1616,9 +1698,11 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let proxy_snap = self.proxy.read().clone();
+                    let config_snap = self.config.read().clone();
+                    let effective_proxy = current_creds.effective_proxy(proxy_snap.as_ref());
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
+                        refresh_token(&current_creds, &config_snap, effective_proxy.as_ref())
                             .await?;
                     {
                         let mut entries = self.entries.lock();
@@ -1654,8 +1738,10 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let proxy_snap = self.proxy.read().clone();
+        let config_snap = self.config.read().clone();
+        let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
+        let usage_limits = get_usage_limits(&credentials, &config_snap, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1767,8 +1853,10 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            let proxy_snap = self.proxy.read().clone();
+            let config_snap = self.config.read().clone();
+            let effective_proxy = new_cred.effective_proxy(proxy_snap.as_ref());
+            refresh_token(&new_cred, &config_snap, effective_proxy.as_ref()).await?
         };
 
         // 4. 分配新 ID
@@ -1904,9 +1992,11 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let proxy_snap = self.proxy.read().clone();
+        let config_snap = self.config.read().clone();
+        let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
         let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+            refresh_token(&credentials, &config_snap, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -1934,7 +2024,7 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config_path = match self.config.read().config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
@@ -2055,9 +2145,11 @@ impl MultiTokenManager {
         }
 
         let _guard = self.refresh_lock.lock().await;
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let proxy_snap = self.proxy.read().clone();
+        let config_snap = self.config.read().clone();
+        let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
 
-        match refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await {
+        match refresh_token(&credentials, &config_snap, effective_proxy.as_ref()).await {
             Ok(new_creds) => {
                 {
                     let mut entries = self.entries.lock();
