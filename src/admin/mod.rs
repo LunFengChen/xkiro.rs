@@ -11,7 +11,13 @@
 //!
 //! # 使用
 //! ```ignore
-//! let admin_service = AdminService::new(token_manager.clone(), endpoint_names);
+//! let admin_service = AdminService::new(
+//!     token_manager.clone(),
+//!     Some(kiro_provider.clone()),
+//!     compression_config.clone(),
+//!     prompt_cache_runtime.clone(),
+//!     endpoint_names,
+//! );
 //! let admin_state = AdminState::new(admin_api_key, admin_service);
 //! let admin_router = create_admin_router(admin_state);
 //! ```

@@ -772,6 +772,20 @@ impl MultiTokenManager {
         self.config.read().clone()
     }
 
+    /// 在写锁内修改全局配置（Admin 热更新使用）
+    ///
+    /// 闭包返回 `Err(_)` 时不会持久化也不会留下半改状态——闭包负责
+    /// 在校验失败时立刻返回错误，调用方再决定如何映射错误。
+    /// 闭包返回 `Ok(_)` 时调用方有责任在闭包内调用 `cfg.save()`。
+    /// 所有运行时镜像（如 `MultiTokenManager.proxy`）的同步由调用方完成。
+    pub fn with_config_mut<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Config) -> R,
+    {
+        let mut guard = self.config.write();
+        f(&mut guard)
+    }
+
     /// 更新全局代理配置（Admin 热更新）
     pub fn update_proxy(&self, proxy: Option<ProxyConfig>) {
         *self.proxy.write() = proxy;

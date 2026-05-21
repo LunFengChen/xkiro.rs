@@ -5,16 +5,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::middleware::PromptCacheRuntime;
+use crate::http_client::ProxyConfig;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::CompressionConfig;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CompressionConfigResponse,
+    CredentialStatusItem, CredentialsStatusResponse, GlobalConfigResponse,
+    LoadBalancingModeResponse, ProxyConfigResponse, SetLoadBalancingModeRequest,
+    UpdateCompressionConfigRequest, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -34,6 +40,12 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    /// Kiro Provider 引用，用于 region/endpoint 热更新
+    kiro_provider: Option<Arc<KiroProvider>>,
+    /// 共享压缩配置，与 AppState 同源（运行时热更新）
+    compression_config: Arc<RwLock<CompressionConfig>>,
+    /// Prompt Cache 运行时（共享引用，支持 ttl/accounting 热更新）
+    prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -43,6 +55,9 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        kiro_provider: Option<Arc<KiroProvider>>,
+        compression_config: Arc<RwLock<CompressionConfig>>,
+        prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -53,6 +68,9 @@ impl AdminService {
 
         Self {
             token_manager,
+            kiro_provider,
+            compression_config,
+            prompt_cache_runtime,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -452,6 +470,289 @@ impl AdminService {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
+        }
+    }
+
+    // ============ 全局代理配置（热更新） ============
+
+    /// 设置凭据 Region（凭据级 region/api_region 覆盖）
+    pub fn set_region(
+        &self,
+        id: u64,
+        region: Option<String>,
+        api_region: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        let region = region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let api_region = api_region
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.token_manager
+            .set_region(id, region, api_region)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据 endpoint（凭据级 endpoint 覆盖，须命中已注册端点）
+    pub fn set_endpoint(
+        &self,
+        id: u64,
+        endpoint: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        let endpoint = endpoint
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if let Some(name) = endpoint.as_deref()
+            && !self.known_endpoints.contains(name)
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            known.sort_unstable();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "endpoint 必须是已注册值，已注册: {:?}，收到: {}",
+                known, name
+            )));
+        }
+
+        self.token_manager
+            .set_endpoint(id, endpoint)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 获取当前代理配置（脱敏）
+    pub fn get_proxy_config(&self) -> ProxyConfigResponse {
+        let config = self.token_manager.config();
+        ProxyConfigResponse {
+            proxy_url: config.proxy_url.clone(),
+            has_credentials: config.proxy_username.is_some()
+                && config.proxy_password.is_some(),
+        }
+    }
+
+    /// 更新代理配置（热更新）
+    pub async fn update_proxy_config(
+        &self,
+        req: UpdateProxyConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        // 1. 构建新的 ProxyConfig
+        let new_proxy = if let Some(url) = &req.proxy_url {
+            if url.trim().is_empty() {
+                None
+            } else {
+                let mut proxy = ProxyConfig::new(url.trim());
+                if let (Some(u), Some(p)) = (&req.proxy_username, &req.proxy_password)
+                    && !u.trim().is_empty()
+                    && !p.trim().is_empty()
+                {
+                    proxy = proxy.with_auth(u.trim(), p.trim());
+                }
+                // 如果未提供新认证信息，保留现有认证
+                if proxy.username.is_none() {
+                    let config = self.token_manager.config();
+                    if let (Some(u), Some(p)) =
+                        (&config.proxy_username, &config.proxy_password)
+                    {
+                        proxy = proxy.with_auth(u, p);
+                    }
+                }
+                Some(proxy)
+            }
+        } else {
+            None
+        };
+
+        // 2. 先持久化配置（失败时不影响运行时状态）
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.proxy_url = new_proxy.as_ref().map(|p| p.url.clone());
+            cfg.proxy_username = new_proxy.as_ref().and_then(|p| p.username.clone());
+            cfg.proxy_password = new_proxy.as_ref().and_then(|p| p.password.clone());
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        // 3. 持久化成功后再应用运行时变更
+        // 注：xkiro 没有 provider.update_global_proxy 与 crate::token::update_proxy 同步点，
+        //     全局代理只通过 MultiTokenManager.update_proxy 生效。
+        self.token_manager.update_proxy(new_proxy);
+
+        Ok(())
+    }
+
+    /// 获取全局配置
+    pub fn get_global_config(&self) -> GlobalConfigResponse {
+        let config = self.token_manager.config();
+        let c = self.compression_config.read();
+        GlobalConfigResponse {
+            region: config.region.clone(),
+            prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
+            prompt_cache_accounting_enabled: config.prompt_cache_accounting_enabled,
+            default_endpoint: config.default_endpoint.clone(),
+            extract_thinking: config.extract_thinking,
+            compression: CompressionConfigResponse {
+                enabled: c.enabled,
+                whitespace_compression: c.whitespace_compression,
+                thinking_strategy: c.thinking_strategy.clone(),
+                tool_result_max_chars: c.tool_result_max_chars,
+                tool_result_head_lines: c.tool_result_head_lines,
+                tool_result_tail_lines: c.tool_result_tail_lines,
+                tool_use_input_max_chars: c.tool_use_input_max_chars,
+                tool_description_max_chars: c.tool_description_max_chars,
+                max_history_turns: c.max_history_turns,
+                max_history_chars: c.max_history_chars,
+                image_max_long_edge: c.image_max_long_edge,
+                image_max_pixels_single: c.image_max_pixels_single,
+                image_max_pixels_multi: c.image_max_pixels_multi,
+                image_multi_threshold: c.image_multi_threshold,
+                max_request_body_bytes: c.max_request_body_bytes,
+            },
+        }
+    }
+
+    /// 更新全局配置（热更新）
+    pub async fn update_global_config(
+        &self,
+        req: UpdateGlobalConfigRequest,
+    ) -> Result<(), AdminServiceError> {
+        // 1. 先持久化配置（失败时不影响运行时状态）
+        self.token_manager.with_config_mut(|cfg| {
+            if let Some(region) = &req.region {
+                let trimmed = region.trim();
+                if trimmed.is_empty() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "Region 不能为空".to_string(),
+                    ));
+                }
+                cfg.region = trimmed.to_string();
+            }
+
+            if let Some(ttl_seconds) = req.prompt_cache_ttl_seconds {
+                if !matches!(ttl_seconds, 300 | 3600) {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "Prompt Cache TTL 仅支持 300（5分钟）或 3600（1小时）".to_string(),
+                    ));
+                }
+                cfg.prompt_cache_ttl_seconds = ttl_seconds;
+            }
+
+            if let Some(enabled) = req.prompt_cache_accounting_enabled {
+                cfg.prompt_cache_accounting_enabled = enabled;
+            }
+
+            if let Some(ref endpoint) = req.default_endpoint {
+                let trimmed = endpoint.trim();
+                if trimmed.is_empty() {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "默认 endpoint 不能为空".to_string(),
+                    ));
+                }
+                if !self.known_endpoints.contains(trimmed) {
+                    let mut known: Vec<&str> =
+                        self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                    known.sort_unstable();
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知的 endpoint: {}，可用值: {:?}",
+                        trimmed, known
+                    )));
+                }
+                cfg.default_endpoint = trimmed.to_string();
+            }
+
+            if let Some(extract) = req.extract_thinking {
+                cfg.extract_thinking = extract;
+            }
+
+            if let Some(c) = &req.compression {
+                Self::apply_compression_fields(&mut cfg.compression, c);
+            }
+
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        // 2. 持久化成功后再应用运行时变更
+        let config = self.token_manager.config();
+
+        // 热更新 region（注：xkiro 已剔除 credential_rpm，故不存在 update_credential_rpm 同步）
+        if req.region.is_some() {
+            self.token_manager.update_region(config.region.clone());
+        }
+
+        // 热更新 default_endpoint（xkiro 无 provider.update_default_endpoint 同步）
+        if req.default_endpoint.is_some() {
+            self.token_manager
+                .update_default_endpoint(config.default_endpoint.clone());
+        }
+
+        // 热更新 Prompt Cache 运行时配置
+        if req.prompt_cache_ttl_seconds.is_some() || req.prompt_cache_accounting_enabled.is_some()
+        {
+            self.prompt_cache_runtime.write().update(
+                req.prompt_cache_ttl_seconds,
+                req.prompt_cache_accounting_enabled,
+            );
+        }
+
+        // 热更新压缩配置到运行时 Arc<RwLock<CompressionConfig>>
+        if let Some(c) = &req.compression {
+            let mut runtime = self.compression_config.write();
+            Self::apply_compression_fields(&mut runtime, c);
+        }
+
+        Ok(())
+    }
+
+    /// 将更新请求中的压缩字段应用到目标 CompressionConfig
+    ///
+    /// 兼容 BK 11 字段 + xkiro 独有 5 字段（image_*  + max_request_body_bytes）。
+    fn apply_compression_fields(
+        target: &mut CompressionConfig,
+        src: &UpdateCompressionConfigRequest,
+    ) {
+        if let Some(v) = src.enabled {
+            target.enabled = v;
+        }
+        if let Some(v) = src.whitespace_compression {
+            target.whitespace_compression = v;
+        }
+        if let Some(ref v) = src.thinking_strategy {
+            target.thinking_strategy = v.clone();
+        }
+        if let Some(v) = src.tool_result_max_chars {
+            target.tool_result_max_chars = v;
+        }
+        if let Some(v) = src.tool_result_head_lines {
+            target.tool_result_head_lines = v;
+        }
+        if let Some(v) = src.tool_result_tail_lines {
+            target.tool_result_tail_lines = v;
+        }
+        if let Some(v) = src.tool_use_input_max_chars {
+            target.tool_use_input_max_chars = v;
+        }
+        if let Some(v) = src.tool_description_max_chars {
+            target.tool_description_max_chars = v;
+        }
+        if let Some(v) = src.max_history_turns {
+            target.max_history_turns = v;
+        }
+        if let Some(v) = src.max_history_chars {
+            target.max_history_chars = v;
+        }
+        // xkiro 独有 5 字段
+        if let Some(v) = src.image_max_long_edge {
+            target.image_max_long_edge = v;
+        }
+        if let Some(v) = src.image_max_pixels_single {
+            target.image_max_pixels_single = v;
+        }
+        if let Some(v) = src.image_max_pixels_multi {
+            target.image_max_pixels_multi = v;
+        }
+        if let Some(v) = src.image_multi_threshold {
+            target.image_multi_threshold = v;
+        }
+        if let Some(v) = src.max_request_body_bytes {
+            target.max_request_body_bytes = v;
         }
     }
 }
