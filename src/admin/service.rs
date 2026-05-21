@@ -17,11 +17,13 @@ use crate::model::config::CompressionConfig;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CompressionConfigResponse,
-    CredentialStatusItem, CredentialsStatusResponse, GlobalConfigResponse,
-    LoadBalancingModeResponse, ProxyConfigResponse, SetLoadBalancingModeRequest,
-    UpdateCompressionConfigRequest, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceItem,
+    CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
+    CredentialsStatusResponse, GlobalConfigResponse, LoadBalancingModeResponse, ProxyConfigResponse,
+    SetLoadBalancingModeRequest, UpdateCompressionConfigRequest, UpdateGlobalConfigRequest,
+    UpdateProxyConfigRequest,
 };
+use crate::kiro::token_manager::CachedBalanceInfo;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -209,6 +211,55 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    /// 获取所有凭据的缓存余额
+    ///
+    /// 双源合并：
+    /// - `token_manager` 提供运行时缓存（cached_at + 动态 ttl_secs）
+    /// - `AdminService` 自身的 disk-backed 5 分钟缓存提供完整快照（usage_limit /
+    ///   usage_percentage / subscription_title），保证字段一致性
+    pub fn get_cached_balances(&self) -> CachedBalancesResponse {
+        // 从 token_manager 获取运行时缓存（含 TTL 信息）
+        let runtime_balances: HashMap<u64, CachedBalanceInfo> = self
+            .token_manager
+            .get_all_cached_balances()
+            .into_iter()
+            .map(|info| (info.id, info))
+            .collect();
+
+        // 从 AdminService 磁盘缓存获取完整余额信息
+        let disk_cache = self.balance_cache.lock();
+
+        let balances = runtime_balances
+            .into_iter()
+            .map(|(id, info)| {
+                // 优先从磁盘缓存获取完整快照（保证字段一致性）
+                if let Some(cached) = disk_cache.get(&id) {
+                    CachedBalanceItem {
+                        id,
+                        remaining: cached.data.remaining,
+                        usage_limit: cached.data.usage_limit,
+                        usage_percentage: cached.data.usage_percentage,
+                        subscription_title: cached.data.subscription_title.clone(),
+                        cached_at: info.cached_at,
+                        ttl_secs: info.ttl_secs,
+                    }
+                } else {
+                    CachedBalanceItem {
+                        id,
+                        remaining: info.remaining,
+                        usage_limit: 0.0,
+                        usage_percentage: 0.0,
+                        subscription_title: None,
+                        cached_at: info.cached_at,
+                        ttl_secs: info.ttl_secs,
+                    }
+                }
+            })
+            .collect();
+
+        CachedBalancesResponse { balances }
     }
 
     /// 添加新凭据

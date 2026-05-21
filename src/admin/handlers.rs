@@ -23,6 +23,12 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/credentials/balances/cached
+/// 获取所有凭据的缓存余额（双源合并：token_manager 运行时缓存 + AdminService 磁盘缓存）
+pub async fn get_cached_balances(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cached_balances())
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(
