@@ -20,6 +20,9 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::background_refresh::{BackgroundRefreshConfig, BackgroundRefresher, RefreshResult};
+use crate::kiro::endpoint::{
+    CLI_ENDPOINT_NAME, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -322,6 +325,25 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 根据凭据生效的 endpoint 名称构造对应的 `KiroEndpoint` 实例
+///
+/// 与 BK 原版 `token_manager.rs` L438-447 字节级对齐：就地 `Box::new` 两种 endpoint
+/// （`IdeEndpoint` / `CliEndpoint` 均无状态，零成本）。
+///
+/// 主链路（API/MCP 调用）仍走 main.rs 注入到 `Provider` 的 endpoint registry；
+/// 此 helper 仅服务于 `get_usage_limits` 这种 token_manager 内部低频路径，
+/// 避免把 endpoint registry 注入 `MultiTokenManager` 结构带来的扩散修改。
+fn endpoint_for_credentials(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> anyhow::Result<Box<dyn KiroEndpoint>> {
+    match credentials.effective_endpoint_name(Some(&config.default_endpoint)) {
+        IDE_ENDPOINT_NAME => Ok(Box::new(IdeEndpoint::new())),
+        CLI_ENDPOINT_NAME => Ok(Box::new(CliEndpoint::new())),
+        name => bail!("未知 endpoint: {}", name),
+    }
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -329,51 +351,25 @@ pub(crate) async fn get_usage_limits(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    tracing::debug!("正在获取使用额度信息...");
+    tracing::debug!(
+        endpoint = %credentials.effective_endpoint_name(Some(&config.default_endpoint)),
+        "正在获取使用额度信息..."
+    );
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
-
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let endpoint = endpoint_for_credentials(credentials, config)?;
+    let ctx = RequestContext {
+        credentials,
+        token,
+        machine_id: &machine_id,
+        config,
+    };
+    let usage = endpoint.usage_request_parts(&ctx)?;
 
     let client = build_client(proxy, 60, config.tls_backend)?;
-
-    let mut request = client
-        .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
-
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+    let mut request = client.get(&usage.url);
+    for (name, value) in usage.headers {
+        request = request.header(name, value);
     }
 
     let response = request.send().await?;
@@ -391,7 +387,15 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
+    let body_text = response.text().await?;
+    let data: UsageLimitsResponse = serde_json::from_str(&body_text).map_err(|e| {
+        tracing::error!(
+            "getUsageLimits JSON 解析失败: {}，原始响应: {}",
+            e,
+            body_text
+        );
+        anyhow::anyhow!("JSON 解析失败: {}", e)
+    })?;
     Ok(data)
 }
 

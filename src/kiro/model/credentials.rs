@@ -261,6 +261,19 @@ impl KiroCredentials {
         }
     }
 
+    /// 解析当前凭据生效的 endpoint 名称
+    ///
+    /// 优先级：凭据级 `endpoint` 字段 > 入参 `default_endpoint`（来自 `Config::default_endpoint`） > 兜底 "ide"
+    ///
+    /// 与 BK 原版字节级对齐（`token_manager::endpoint_for_credentials` 使用此方法 match）
+    pub fn effective_endpoint_name<'a>(&'a self, default_endpoint: Option<&'a str>) -> &'a str {
+        self.endpoint
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(default_endpoint)
+            .unwrap_or("ide")
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
