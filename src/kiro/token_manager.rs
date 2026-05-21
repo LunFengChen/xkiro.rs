@@ -1562,6 +1562,9 @@ impl MultiTokenManager {
         };
 
         // 收集所有凭据
+        //
+        // 仅持久化「手动禁用」状态：自动禁用（失败阈值 / 额度用尽 / 认证失败 /
+        // 模型不可用等）不落盘，避免重启后自动禁用被误标记为手动禁用，导致无法自愈。
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -1569,8 +1572,7 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
+                    cred.disabled = e.disabled_reason == Some(DisabledReason::Manual);
                     cred
                 })
                 .collect()
