@@ -243,3 +243,45 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 
     total.max(1)
 }
+
+/// 计算系统消息的 tokens（cache_tracker 使用）
+pub fn count_system_message_tokens(message: &SystemMessage) -> u64 {
+    count_tokens(&message.text)
+}
+
+/// 计算工具定义的 tokens（cache_tracker 使用）
+pub fn count_tool_definition_tokens(tool: &Tool) -> u64 {
+    let mut total = count_tokens(&tool.name) + count_tokens(&tool.description);
+    let input_schema_json = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+    total += count_tokens(&input_schema_json);
+    total
+}
+
+/// 计算消息内容的 tokens（cache_tracker 使用）
+///
+/// 支持 string / array / object 三种 JSON 形态，
+/// 递归处理 ContentBlock 内的 text/thinking/input/content 字段。
+pub fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                return count_tokens(text);
+            }
+            if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
+                return count_tokens(thinking);
+            }
+            if let Some(input) = obj.get("input") {
+                let json = serde_json::to_string(input).unwrap_or_default();
+                return count_tokens(&json);
+            }
+            if let Some(content) = obj.get("content") {
+                return count_message_content_tokens(content);
+            }
+            0
+        }
+        _ => 0,
+    }
+}

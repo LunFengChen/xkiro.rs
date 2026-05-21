@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 default = ["native-tls"]
 native-tls = ["reqwest/native-tls-vendored"]
+# 打开后会输出请求体大小/截断后的请求体片段，用于排查上游错误。
+# 默认关闭：避免日志中出现敏感内容（凭据、用户对话）。
+sensitive-logs = []
 
 [profile.release]
 lto = true
@@ -39,3 +42,4 @@ subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 unicode-segmentation = "1.13"  # UAX #29 grapheme cluster 安全截断
+serde_cbor = "0.11"   # CBOR 编解码（Web Portal API）

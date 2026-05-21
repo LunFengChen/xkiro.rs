@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
+use kiro::background_refresh::BackgroundRefreshConfig;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -143,12 +144,19 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 启动后台 Token 刷新任务（默认配置：每 60s 检查一次，提前 15 分钟刷新）
+    let _background_refresher =
+        token_manager.start_background_refresh(BackgroundRefreshConfig::default());
+    tracing::info!("后台 Token 刷新任务已启动");
+
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
     );
+    let kiro_provider = Arc::new(kiro_provider);
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -162,12 +170,22 @@ async fn main() {
     // 共享压缩配置（admin API 可运行时修改）
     let compression_config = Arc::new(RwLock::new(config.compression.clone()));
 
-    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    // Prompt Cache 运行时（共享引用，支持热更新）
+    let prompt_cache_runtime = Arc::new(RwLock::new(
+        anthropic::middleware::PromptCacheRuntime::new(
+            config.prompt_cache_ttl_seconds,
+            config.prompt_cache_accounting_enabled,
+        ),
+    ));
+
+    // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
-        Some(kiro_provider),
+        Some(kiro_provider.clone()),
+        first_credentials.profile_arn.clone(),
         config.extract_thinking,
         compression_config.clone(),
+        prompt_cache_runtime.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

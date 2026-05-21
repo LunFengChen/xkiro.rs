@@ -94,6 +94,58 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// Agentic 模型专用系统提示
+///
+/// 指导模型在 agentic 模式下的行为：持续工作、自主决策、减少确认
+const KIRO_AGENTIC_SYSTEM_PROMPT: &str = "\
+You are an autonomous coding agent. Follow these principles:\n\
+1. Work continuously until the task is fully complete.\n\
+2. Use tools proactively without asking for permission.\n\
+3. When encountering errors, debug and fix them autonomously.\n\
+4. Break complex tasks into steps and execute them sequentially.\n\
+5. Verify your work by reading files after writing them.\n\
+6. Never ask the user for confirmation mid-task — just proceed.\n\
+7. If a tool call fails, try alternative approaches before giving up.\n\
+8. Prefer making changes directly over explaining what you would do.";
+
+/// 单次请求中所有消息合计的图片配额上限
+///
+/// 超过此数量的图片会被丢弃，避免 base64 体积过大导致上游 400
+const MAX_TOTAL_IMAGES: usize = 20;
+
+/// 统计单个消息内容中的图片数量
+fn count_images_in_content(content: &serde_json::Value) -> usize {
+    match content {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("image"))
+            .count(),
+        _ => 0,
+    }
+}
+
+/// 判断模型名是否为 agentic 变体（以 `-agentic` 结尾，忽略大小写）
+pub fn is_agentic_model(model: &str) -> bool {
+    model.to_lowercase().ends_with("-agentic")
+}
+
+/// 请求工具列表中是否包含 Write 或 Edit 工具
+fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == "Write" || t.name == "Edit"))
+}
+
+/// build_history 的参数包，避免长签名
+struct BuildHistoryContext<'a> {
+    model_id: &'a str,
+    compression_config: &'a CompressionConfig,
+    total_image_count: usize,
+    is_agentic: bool,
+    remaining_image_budget: &'a mut usize,
+    tool_name_map: &'a mut HashMap<String, String>,
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -285,10 +337,23 @@ pub fn convert_request(
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
+    // 4.5. 统计图片总数（含末尾 user 与历史中的所有 user）
+    let total_image_count: usize = messages
+        .iter()
+        .map(|msg| count_images_in_content(&msg.content))
+        .sum();
+
+    // 4.6. 初始化图片配额（所有消息合计，含 GIF 抽帧后的帧数）
+    let mut remaining_image_budget = MAX_TOTAL_IMAGES;
+
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) =
-        process_message_content(&last_message.content, compression_config, 0)?;
+    let (text_content, images, tool_results) = process_message_content(
+        &last_message.content,
+        compression_config,
+        total_image_count,
+        &mut remaining_image_budget,
+    )?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -298,9 +363,14 @@ pub fn convert_request(
     let mut history = build_history(
         req,
         messages,
-        &model_id,
-        &mut tool_name_map,
-        compression_config,
+        BuildHistoryContext {
+            model_id: &model_id,
+            compression_config,
+            total_image_count,
+            is_agentic: is_agentic_model(&req.model),
+            remaining_image_budget: &mut remaining_image_budget,
+            tool_name_map: &mut tool_name_map,
+        },
     )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
@@ -337,6 +407,18 @@ pub fn convert_request(
     }
     if !validated_tool_results.is_empty() {
         context = context.with_tool_results(validated_tool_results);
+    }
+
+    // 12.5. 图片配额统计日志
+    let actual_image_count = MAX_TOTAL_IMAGES - remaining_image_budget;
+    if actual_image_count > 0 || total_image_count > 0 {
+        tracing::info!(
+            source_image_count = total_image_count,
+            actual_image_count = actual_image_count,
+            images_dropped = total_image_count.saturating_sub(actual_image_count),
+            budget_remaining = remaining_image_budget,
+            "图片统计"
+        );
     }
 
     // 12. 构建当前消息
@@ -381,7 +463,8 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
     compression_config: &CompressionConfig,
-    image_count_hint: usize,
+    total_image_count: usize,
+    remaining_image_budget: &mut usize,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -401,67 +484,133 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    if compression_config.enabled && format == "gif" {
-                                        match crate::image::process_gif_frames(
-                                            &source.data,
-                                            compression_config,
-                                            image_count_hint,
-                                            20,
-                                        ) {
-                                            Ok(result) => {
-                                                for frame in result.frames {
+                            if let Some(source) = block.source
+                                && let Some(format) = get_image_format(&source.media_type)
+                            {
+                                // GIF：抽帧为多张静态图，避免动图 base64 体积巨大导致上游 400
+                                if format.eq_ignore_ascii_case("gif") {
+                                    if *remaining_image_budget == 0 {
+                                        tracing::warn!("图片配额已用尽，跳过 GIF");
+                                        continue;
+                                    }
+                                    match crate::image::process_gif_frames(
+                                        &source.data,
+                                        compression_config,
+                                        total_image_count,
+                                        *remaining_image_budget,
+                                    ) {
+                                        Ok(gif) => {
+                                            let total_final_bytes: usize =
+                                                gif.frames.iter().map(|f| f.final_bytes_len).sum();
+                                            tracing::info!(
+                                                duration_ms = gif.duration_ms,
+                                                source_frames = gif.source_frames,
+                                                sampled_frames = gif.frames.len(),
+                                                sampling_interval_ms = gif.sampling_interval_ms,
+                                                output_format = gif.output_format,
+                                                original_bytes_len =
+                                                    gif.frames[0].original_bytes_len,
+                                                total_final_bytes = total_final_bytes,
+                                                "GIF 已抽帧并重编码"
+                                            );
+
+                                            let frame_count = gif.frames.len();
+                                            for f in gif.frames {
+                                                images.push(KiroImage::from_base64(
+                                                    gif.output_format,
+                                                    f.data,
+                                                ));
+                                            }
+                                            *remaining_image_budget =
+                                                remaining_image_budget.saturating_sub(frame_count);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "GIF 抽帧失败，回退为静态图（可能丢失动图信息）: {}",
+                                                e
+                                            );
+                                            if *remaining_image_budget == 0 {
+                                                tracing::warn!("图片配额已用尽，跳过 GIF 回退");
+                                                continue;
+                                            }
+                                            match crate::image::process_image_to_format(
+                                                &source.data,
+                                                "jpeg",
+                                                compression_config,
+                                                total_image_count,
+                                            ) {
+                                                Ok(result) => {
                                                     images.push(KiroImage::from_base64(
-                                                        result.output_format,
-                                                        frame.data,
+                                                        "jpeg",
+                                                        result.data,
                                                     ));
+                                                    *remaining_image_budget -= 1;
                                                 }
-                                            }
-                                            Err(_) => {
-                                                match crate::image::process_image(
-                                                    &source.data,
-                                                    &format,
-                                                    compression_config,
-                                                    image_count_hint,
-                                                ) {
-                                                    Ok(result) => {
-                                                        images.push(KiroImage::from_base64(
-                                                            format,
-                                                            result.data,
-                                                        ));
-                                                    }
-                                                    Err(_) => {
-                                                        images.push(KiroImage::from_base64(
-                                                            format,
-                                                            source.data,
-                                                        ));
+                                                Err(e2) => {
+                                                    tracing::warn!(
+                                                        "GIF 回退重编码失败，尝试静态 GIF: {}",
+                                                        e2
+                                                    );
+                                                    match crate::image::process_image(
+                                                        &source.data,
+                                                        &format,
+                                                        compression_config,
+                                                        total_image_count,
+                                                    ) {
+                                                        Ok(result) => {
+                                                            images.push(KiroImage::from_base64(
+                                                                format,
+                                                                result.data,
+                                                            ));
+                                                            *remaining_image_budget -= 1;
+                                                        }
+                                                        Err(e3) => {
+                                                            tracing::warn!(
+                                                                "图片处理失败，使用原始数据: {}",
+                                                                e3
+                                                            );
+                                                            images.push(KiroImage::from_base64(
+                                                                format,
+                                                                source.data,
+                                                            ));
+                                                            *remaining_image_budget -= 1;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                    } else if compression_config.enabled {
-                                        match crate::image::process_image(
-                                            &source.data,
-                                            &format,
-                                            compression_config,
-                                            image_count_hint,
-                                        ) {
-                                            Ok(result) => {
-                                                images.push(KiroImage::from_base64(
-                                                    format,
-                                                    result.data,
-                                                ));
+                                    }
+                                } else {
+                                    // 处理静态图片（可能缩放）
+                                    if *remaining_image_budget == 0 {
+                                        tracing::warn!("图片配额已用尽，跳过静态图片");
+                                        continue;
+                                    }
+                                    match crate::image::process_image(
+                                        &source.data,
+                                        &format,
+                                        compression_config,
+                                        total_image_count,
+                                    ) {
+                                        Ok(result) => {
+                                            if result.was_resized {
+                                                tracing::info!(
+                                                    "图片已缩放: {:?} -> {:?}, tokens: {}",
+                                                    result.original_size,
+                                                    result.final_size,
+                                                    result.tokens
+                                                );
                                             }
-                                            Err(_) => {
-                                                images.push(KiroImage::from_base64(
-                                                    format,
-                                                    source.data,
-                                                ));
-                                            }
+                                            images
+                                                .push(KiroImage::from_base64(format, result.data));
+                                            *remaining_image_budget -= 1;
                                         }
-                                    } else {
-                                        images.push(KiroImage::from_base64(format, source.data));
+                                        Err(e) => {
+                                            tracing::warn!("图片处理失败，使用原始数据: {}", e);
+                                            images
+                                                .push(KiroImage::from_base64(format, source.data));
+                                            *remaining_image_budget -= 1;
+                                        }
                                     }
                                 }
                             }
@@ -756,14 +905,23 @@ fn has_thinking_tags(content: &str) -> bool {
 fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
-    model_id: &str,
-    tool_name_map: &mut HashMap<String, String>,
-    compression_config: &CompressionConfig,
+    ctx: BuildHistoryContext<'_>,
 ) -> Result<Vec<Message>, ConversionError> {
+    let BuildHistoryContext {
+        model_id,
+        compression_config,
+        total_image_count,
+        is_agentic,
+        remaining_image_budget,
+        tool_name_map,
+    } = ctx;
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+
+    // 仅在请求包含 Write/Edit 工具时注入分块写入策略
+    let should_inject_chunked_policy = has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -774,8 +932,12 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 仅在存在 Write/Edit 工具时追加分块写入策略到系统消息
+            let system_content = if should_inject_chunked_policy {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -795,12 +957,31 @@ fn build_history(
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    } else if thinking_prefix.is_some() || should_inject_chunked_policy {
+        // 没有系统消息但需要注入 thinking 配置或分块写入策略
+        let mut parts = Vec::new();
+        if let Some(ref prefix) = thinking_prefix {
+            parts.push(prefix.clone());
+        }
+        if should_inject_chunked_policy {
+            parts.push(SYSTEM_CHUNKED_POLICY.to_string());
+        }
+        let content = parts.join("\n");
+
+        let user_msg = HistoryUserMessage::new(content, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+        history.push(Message::Assistant(assistant_msg));
+    }
+
+    // Agentic 模型：追加专用系统提示
+    if is_agentic {
+        let user_msg = HistoryUserMessage::new(KIRO_AGENTIC_SYSTEM_PROMPT, model_id);
+        history.push(Message::User(user_msg));
+
+        let assistant_msg =
+            HistoryAssistantMessage::new("I will work autonomously following these principles.");
         history.push(Message::Assistant(assistant_msg));
     }
 
@@ -813,9 +994,7 @@ fn build_history(
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages.iter().take(history_end_index) {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
@@ -827,7 +1006,13 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id, compression_config)?;
+                let merged_user = merge_user_messages(
+                    &user_buffer,
+                    model_id,
+                    compression_config,
+                    total_image_count,
+                    remaining_image_budget,
+                )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -844,7 +1029,13 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, compression_config)?;
+        let merged_user = merge_user_messages(
+            &user_buffer,
+            model_id,
+            compression_config,
+            total_image_count,
+            remaining_image_budget,
+        )?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -860,14 +1051,20 @@ fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
     compression_config: &CompressionConfig,
+    total_image_count: usize,
+    remaining_image_budget: &mut usize,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) =
-            process_message_content(&msg.content, compression_config, 0)?;
+        let (text, images, tool_results) = process_message_content(
+            &msg.content,
+            compression_config,
+            total_image_count,
+            remaining_image_budget,
+        )?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1231,6 +1428,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -1299,6 +1497,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,

@@ -22,16 +22,36 @@ use super::{
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+///
+/// # 端点
+/// ## 标准端点 (/v1)
+/// - `GET /v1/models` - 获取可用模型列表
+/// - `POST /v1/messages` - 创建消息（对话）
+/// - `POST /v1/messages/count_tokens` - 计算 token 数量
+///
+/// ## Claude Code 兼容端点 (/cc/v1)
+/// - `POST /cc/v1/messages` - 创建消息（流式响应会等待 contextUsageEvent 后再发送 message_start）
+/// - `POST /cc/v1/messages/count_tokens` - 计算 token 数量
+///
+/// # 认证
+/// 所有路径需要 API Key 认证，支持：
+/// - `x-api-key` header
+/// - `Authorization: Bearer ***` header
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
+    profile_arn: Option<String>,
     extract_thinking: bool,
     compression: Arc<RwLock<CompressionConfig>>,
+    prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking)
-        .with_compression(compression);
+    let mut state = AppState::new(api_key, extract_thinking, prompt_cache_runtime)
+        .with_compression_config(compression);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
+    }
+    if let Some(arn) = profile_arn {
+        state = state.with_profile_arn(arn);
     }
 
     // 需要认证的 /v1 路由

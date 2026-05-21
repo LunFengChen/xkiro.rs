@@ -11,9 +11,20 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
-pub use ide::IdeEndpoint;
+pub use cli::{CLI_ENDPOINT_NAME, CliEndpoint};
+pub use ide::{IDE_ENDPOINT_NAME, IdeEndpoint};
+
+/// 单次使用额度查询请求所需的 URL + headers
+///
+/// 不同端点的 getUsageLimits URL 参数和 user-agent 不同，封装成统一返回值，
+/// 由调用方组装 reqwest 请求并发送。
+pub struct UsageRequestParts {
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+}
 
 /// Kiro 端点
 ///

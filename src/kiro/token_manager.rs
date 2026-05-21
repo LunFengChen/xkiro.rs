@@ -13,10 +13,13 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::affinity::UserAffinityManager;
+use crate::kiro::background_refresh::{BackgroundRefreshConfig, BackgroundRefresher, RefreshResult};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -526,6 +529,9 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    affinity: UserAffinityManager,
+    /// 后台 Token 刷新任务（启动后由 Drop 自动停止）
+    background_refresher: Mutex<Option<Arc<BackgroundRefresher>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -655,6 +661,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            affinity: UserAffinityManager::new(),
+            background_refresher: Mutex::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -740,6 +748,47 @@ impl MultiTokenManager {
                 Some((entry.id, entry.credentials.clone()))
             }
         }
+    }
+
+    /// 基于 user_id 的凭据亲和绑定路径
+    ///
+    /// 同一 user_id 优先复用上次绑定的凭据；若绑定凭据已被禁用或获取 token 失败，
+    /// fallback 到 acquire_context 重新选；没有 user_id 时直接走原 acquire_context。
+    pub async fn acquire_context_for_user(
+        &self,
+        user_id: Option<&str>,
+        model: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        let user_id = match user_id {
+            Some(id) if !id.is_empty() => id,
+            _ => return self.acquire_context(model).await,
+        };
+
+        if let Some(bound_id) = self.affinity.get(user_id) {
+            let is_enabled = {
+                let entries = self.entries.lock();
+                entries.iter().any(|e| e.id == bound_id && !e.disabled)
+            };
+            if is_enabled {
+                let credentials = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == bound_id)
+                        .map(|e| e.credentials.clone())
+                };
+                if let Some(creds) = credentials {
+                    if let Ok(ctx) = self.try_ensure_token(bound_id, &creds).await {
+                        self.affinity.touch(user_id);
+                        return Ok(ctx);
+                    }
+                }
+            }
+        }
+
+        let ctx = self.acquire_context(model).await?;
+        self.affinity.set(user_id, ctx.id);
+        Ok(ctx)
     }
 
     /// 获取 API 调用上下文
@@ -1178,6 +1227,7 @@ impl MultiTokenManager {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
+                self.affinity.remove_by_credential(id);
 
                 // 切换到优先级最高的可用凭据
                 if let Some(next) = entries
@@ -1227,6 +1277,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            self.affinity.remove_by_credential(id);
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
@@ -1287,6 +1338,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            self.affinity.remove_by_credential(id);
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -1336,6 +1388,7 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            self.affinity.remove_by_credential(id);
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -1920,6 +1973,119 @@ impl MultiTokenManager {
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
+    }
+
+    // ==================== 后台 Token 刷新 API ====================
+    /// 获取所有即将过期的凭据 ID（不含已禁用条目）
+    ///
+    /// # Arguments
+    /// * `minutes_before_expiry` - 提前多少分钟视为「即将过期」
+    pub fn get_expiring_credential_ids(&self, minutes_before_expiry: i64) -> Vec<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e.credentials.is_api_key_credential()
+                    && is_token_expiring_within(&e.credentials, minutes_before_expiry)
+                        .unwrap_or(false)
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 启动后台 Token 刷新任务
+    ///
+    /// 重复调用会先停止旧任务，再启动新任务。
+    pub fn start_background_refresh(
+        self: &Arc<Self>,
+        config: BackgroundRefreshConfig,
+    ) -> Arc<BackgroundRefresher> {
+        // 停止已有任务（如果存在）
+        if let Some(old) = self.background_refresher.lock().take() {
+            old.stop();
+        }
+
+        let refresher = Arc::new(BackgroundRefresher::new(config.clone()));
+        let manager_for_refresh = Arc::clone(self);
+        let manager_for_ids = Arc::clone(self);
+        let refresh_before_mins = config.refresh_before_expiry_mins;
+
+        if let Err(e) = refresher.start(
+            move |id| {
+                let manager = Arc::clone(&manager_for_refresh);
+                Box::pin(async move {
+                    match manager.refresh_token_for_credential(id).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::warn!("后台刷新凭据 #{} Token 失败: {}", id, e);
+                            false
+                        }
+                    }
+                })
+            },
+            move |mins| {
+                manager_for_ids.get_expiring_credential_ids(mins.max(refresh_before_mins))
+            },
+        ) {
+            tracing::error!("启动后台刷新任务失败: {}", e);
+        }
+
+        *self.background_refresher.lock() = Some(Arc::clone(&refresher));
+        refresher
+    }
+
+    /// 刷新指定凭据的 Token（带优雅降级）
+    ///
+    /// 如果刷新失败但现有 Token 仍未过期，返回 fallback 结果继续使用现有 Token。
+    pub async fn refresh_token_for_credential(&self, id: u64) -> anyhow::Result<RefreshResult> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // API Key 凭据无需刷新
+        if credentials.is_api_key_credential() {
+            let expires_at = credentials.expires_at.unwrap_or_default();
+            return Ok(RefreshResult::success(id, expires_at));
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+
+        match refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await {
+            Ok(new_creds) => {
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                        entry.refresh_failure_count = 0;
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败: {}", e);
+                }
+                let expires_at = new_creds.expires_at.unwrap_or_default();
+                Ok(RefreshResult::success(id, expires_at))
+            }
+            Err(e) => {
+                if !is_token_expired(&credentials) {
+                    let expires_at = credentials.expires_at.unwrap_or_default();
+                    tracing::warn!(
+                        "凭据 #{} Token 刷新失败，使用现有 Token（优雅降级）: {}",
+                        id,
+                        e
+                    );
+                    Ok(RefreshResult::fallback(id, expires_at))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 

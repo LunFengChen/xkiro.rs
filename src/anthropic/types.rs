@@ -3,6 +3,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// === 缓存控制 ===
+
+/// 缓存控制配置
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
 // === 错误响应 ===
 
 /// API 错误响应
@@ -49,6 +60,12 @@ pub struct Model {
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
 }
 
 /// 模型列表响应
@@ -61,7 +78,7 @@ pub struct ModelsResponse {
 // === Messages 端点类型 ===
 
 /// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
+const MAX_BUDGET_TOKENS: i32 = 128_000;
 
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
@@ -112,10 +129,11 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
+    /// 为 Anthropic API 兼容保留，实际不透传给 Kiro 上游
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -151,6 +169,8 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                block_type: None,
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +219,10 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub block_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义
@@ -223,6 +247,19 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 缓存控制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl Tool {
+    /// 检查是否为 WebSearch 工具
+    #[allow(dead_code)]
+    pub fn is_web_search(&self) -> bool {
+        self.tool_type
+            .as_ref()
+            .is_some_and(|t| t.starts_with("web_search"))
+    }
 }
 
 /// 内容块
@@ -248,6 +285,8 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 图片数据源
@@ -280,4 +319,19 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+/// 根据模型名称获取上下文窗口大小
+///
+/// - Opus 4.6 和 Sonnet 4.6 系列: 1,000,000 tokens
+/// - 其他模型: 200,000 tokens
+pub fn get_context_window_size(model: &str) -> i32 {
+    let model_lower = model.to_lowercase();
+    if (model_lower.contains("opus") || model_lower.contains("sonnet"))
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
+    {
+        1_000_000
+    } else {
+        200_000
+    }
 }

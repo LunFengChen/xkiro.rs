@@ -72,6 +72,20 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// 移除历史用户消息中的所有图片，返回移除的图片数量
+    ///
+    /// 用于自适应二次压缩：保留 current_message 图片，仅丢弃 history 中的图片。
+    pub fn remove_history_images(&mut self) -> usize {
+        let mut removed = 0;
+        for msg in &mut self.history {
+            if let Message::User(user_msg) = msg {
+                removed += user_msg.user_input_message.images.len();
+                user_msg.user_input_message.images.clear();
+            }
+        }
+        removed
+    }
 }
 
 /// 当前消息容器
@@ -210,6 +224,29 @@ pub enum Message {
     User(HistoryUserMessage),
     /// 助手消息
     Assistant(HistoryAssistantMessage),
+}
+
+#[allow(dead_code)]
+impl Message {
+    /// 创建用户消息
+    pub fn user(content: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self::User(HistoryUserMessage::new(content, model_id))
+    }
+
+    /// 创建助手消息
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::Assistant(HistoryAssistantMessage::new(content))
+    }
+
+    /// 判断是否为用户消息
+    pub fn is_user(&self) -> bool {
+        matches!(self, Self::User(_))
+    }
+
+    /// 判断是否为助手消息
+    pub fn is_assistant(&self) -> bool {
+        matches!(self, Self::Assistant(_))
+    }
 }
 
 /// 历史用户消息

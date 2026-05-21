@@ -214,6 +214,14 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// Prompt Cache TTL（秒），默认 300 秒
+    #[serde(default = "default_prompt_cache_ttl_seconds")]
+    pub prompt_cache_ttl_seconds: u64,
+
+    /// 是否启用本地 Prompt Cache usage 记账，默认 true
+    #[serde(default = "default_true")]
+    pub prompt_cache_accounting_enabled: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -260,6 +268,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_prompt_cache_ttl_seconds() -> u64 {
+    300
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -290,6 +302,8 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
+            prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
+            prompt_cache_accounting_enabled: default_true(),
             config_path: None,
         }
     }

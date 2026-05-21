@@ -40,7 +40,6 @@ pub fn compress_tools_if_needed(tools: &[KiroTool]) -> Vec<KiroTool> {
         );
         return compressed;
     }
-
     // 第二步：按比例截断 description（基于字节大小）
     let ratio = TOOL_SIZE_THRESHOLD as f64 / size_after_schema as f64;
     for tool in &mut compressed {
