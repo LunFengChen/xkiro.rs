@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -567,6 +567,12 @@ pub struct MultiTokenManager {
     affinity: UserAffinityManager,
     /// 余额缓存（用于负载均衡和故障转移时选择最优凭据）
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    /// MODEL_TEMPORARILY_UNAVAILABLE 错误累计（达到阈值后全局禁用）
+    model_unavailable_count: AtomicU32,
+    /// 选凭据轮询计数器（多个凭据评分相同时兜底使用，避免总选第一个）
+    selection_rr: AtomicU64,
+    /// 全局禁用恢复时间（None 表示当前没有全局禁用）
+    global_recovery_time: Mutex<Option<DateTime<Utc>>>,
     /// 后台 Token 刷新任务（启动后由 Drop 自动停止）
     background_refresher: Mutex<Option<Arc<BackgroundRefresher>>>,
 }
@@ -588,6 +594,11 @@ const HIGH_FREQ_THRESHOLD: u32 = 20;
 const USAGE_COUNT_RESET_SECS: u64 = 600;
 /// 余额缓存：低余额阈值（小于此值切到长 TTL）
 const LOW_BALANCE_THRESHOLD: f64 = 1.0;
+
+/// MODEL_TEMPORARILY_UNAVAILABLE 累计阈值（达到后全局禁用所有凭据）
+const MODEL_UNAVAILABLE_THRESHOLD: u32 = 2;
+/// 全局禁用自动恢复延迟（分钟）
+const GLOBAL_DISABLE_RECOVERY_MINUTES: i64 = 5;
 
 /// API 调用上下文
 ///
@@ -731,6 +742,9 @@ impl MultiTokenManager {
             stats_dirty: AtomicBool::new(false),
             affinity: UserAffinityManager::new(),
             balance_cache: Mutex::new(initial_cache),
+            model_unavailable_count: AtomicU32::new(0),
+            selection_rr: AtomicU64::new(0),
+            global_recovery_time: Mutex::new(None),
             background_refresher: Mutex::new(None),
         };
 
@@ -818,12 +832,12 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
-
+                // 贴合 BK：在所有可用候选中按 (recent_usage 最小, remaining 最大, rr 兜底) 选最优
+                let candidate_ids: Vec<u64> = available.iter().map(|e| e.id).collect();
+                drop(entries);
+                let id = self.select_best_candidate_id(&candidate_ids)?;
+                let entries = self.entries.lock();
+                let entry = entries.iter().find(|e| e.id == id)?;
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
@@ -886,6 +900,9 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        // 检查是否需要自动恢复（5 分钟全局禁用）
+        self.check_and_recover();
+
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1004,6 +1021,188 @@ impl MultiTokenManager {
                 );
                 *current_id = best.id;
             }
+        }
+    }
+
+    /// 选择最佳凭据（两级排序：使用次数最少 + 余额最多；完全相同则轮询）
+    ///
+    /// 对齐 BK：
+    /// - 第一优先级：`recent_usage` 最小（未初始化的视为 u32::MAX，避免被优先选中）
+    /// - 第二优先级：`remaining` 最大（NaN 归一化为 0.0）
+    /// - 完全相同时使用 `selection_rr` 轮询兜底，避免总选第一个
+    fn select_best_candidate_id(&self, candidate_ids: &[u64]) -> Option<u64> {
+        if candidate_ids.is_empty() {
+            return None;
+        }
+
+        let rr = self.selection_rr.fetch_add(1, Ordering::Relaxed) as usize;
+        let cache = self.balance_cache.lock();
+
+        let mut scored: Vec<(u64, u32, f64)> = Vec::with_capacity(candidate_ids.len());
+        for &id in candidate_ids {
+            let (usage, balance, initialized) = cache
+                .get(&id)
+                .map(|c| (c.recent_usage, c.remaining, c.initialized))
+                .unwrap_or((0, 0.0, false));
+            // 未初始化的凭据视为使用次数最大，避免被优先选中
+            let effective_usage = if initialized { usage } else { u32::MAX };
+            // NaN 余额归一化为 0.0，避免 total_cmp 将 NaN 视为最大值
+            let effective_balance = if balance.is_finite() { balance } else { 0.0 };
+            scored.push((id, effective_usage, effective_balance));
+        }
+        drop(cache);
+
+        // 第一优先级：使用次数最少
+        let min_usage = scored.iter().map(|(_, usage, _)| *usage).min()?;
+        scored.retain(|(_, usage, _)| *usage == min_usage);
+
+        // 第二优先级：余额最多（使用次数相同）
+        let mut max_balance = scored.first().map(|(_, _, b)| *b).unwrap_or(0.0);
+        for &(_, _, balance) in &scored {
+            if balance > max_balance {
+                max_balance = balance;
+            }
+        }
+        scored.retain(|(_, _, balance)| *balance == max_balance);
+
+        if scored.len() == 1 {
+            return Some(scored[0].0);
+        }
+
+        // 兜底：完全相同则轮询，避免总选第一个
+        let index = rr % scored.len();
+        Some(scored[index].0)
+    }
+
+    // ============================================================
+    // 全局健康协调（model_unavailable + 全局禁用 + 自动恢复）
+    // 对齐 BK：MODEL_TEMPORARILY_UNAVAILABLE 错误累计触发全局禁用，
+    // 5 分钟后自动恢复 ModelUnavailable 类型禁用。
+    // ============================================================
+
+    /// 报告 MODEL_TEMPORARILY_UNAVAILABLE 错误
+    ///
+    /// 累计达到阈值后禁用所有凭据，5 分钟后自动恢复
+    /// 返回是否触发了全局禁用
+    pub fn report_model_unavailable(&self) -> bool {
+        let count = self.model_unavailable_count.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            "MODEL_TEMPORARILY_UNAVAILABLE 错误（{}/{}）",
+            count,
+            MODEL_UNAVAILABLE_THRESHOLD
+        );
+
+        if count >= MODEL_UNAVAILABLE_THRESHOLD {
+            self.disable_all_credentials(DisabledReason::ModelUnavailable);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 禁用所有凭据并设置全局恢复时间
+    fn disable_all_credentials(&self, reason: DisabledReason) {
+        let mut entries = self.entries.lock();
+        let mut recovery_time = self.global_recovery_time.lock();
+
+        for entry in entries.iter_mut() {
+            if !entry.disabled {
+                entry.disabled = true;
+                entry.disabled_reason = Some(reason);
+            }
+        }
+
+        // 设置恢复时间
+        let recover_at = Utc::now() + Duration::minutes(GLOBAL_DISABLE_RECOVERY_MINUTES);
+        *recovery_time = Some(recover_at);
+
+        tracing::error!(
+            "所有凭据已被禁用（原因: {:?}），将于 {} 自动恢复",
+            reason,
+            recover_at.format("%H:%M:%S")
+        );
+    }
+
+    /// 检查并执行自动恢复
+    ///
+    /// 如果已到恢复时间，恢复因 ModelUnavailable 禁用的凭据
+    /// 余额不足、认证失败、账户暂停等不会被自动恢复
+    ///
+    /// 返回是否执行了恢复
+    pub fn check_and_recover(&self) -> bool {
+        let should_recover = {
+            let recovery_time = self.global_recovery_time.lock();
+            recovery_time.map(|t| Utc::now() >= t).unwrap_or(false)
+        };
+
+        if !should_recover {
+            return false;
+        }
+
+        let mut entries = self.entries.lock();
+        let mut recovery_time = self.global_recovery_time.lock();
+        let mut recovered_count = 0;
+
+        for entry in entries.iter_mut() {
+            // 只恢复因 ModelUnavailable 禁用的凭据
+            if entry.disabled && entry.disabled_reason == Some(DisabledReason::ModelUnavailable) {
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+                recovered_count += 1;
+            }
+        }
+
+        // 重置全局状态
+        *recovery_time = None;
+        self.model_unavailable_count.store(0, Ordering::SeqCst);
+
+        if recovered_count > 0 {
+            tracing::info!("已自动恢复 {} 个凭据", recovered_count);
+        }
+
+        recovered_count > 0
+    }
+
+    /// 获取全局恢复时间（用于 Admin API）
+    #[allow(dead_code)]
+    pub fn get_recovery_time(&self) -> Option<DateTime<Utc>> {
+        *self.global_recovery_time.lock()
+    }
+
+    /// 标记凭据为认证失败（如 invalid_grant，不会被自动恢复）
+    pub fn mark_authentication_failed(&self, id: u64) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::AuthenticationFailed);
+                tracing::warn!("凭据 #{} 已标记为认证失败", id);
+            }
+        }
+        self.affinity.remove_by_credential(id);
+    }
+
+    /// 标记凭据为账户暂停（不会被自动恢复）
+    pub fn mark_account_suspended(&self, id: u64) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                tracing::warn!("凭据 #{} 已标记为账户暂停", id);
+            }
+        }
+        self.affinity.remove_by_credential(id);
+    }
+
+    /// 标记凭据为余额不足（不会被自动恢复）
+    pub fn mark_insufficient_balance(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::InsufficientBalance);
+            tracing::warn!("凭据 #{} 已标记为余额不足", id);
         }
     }
 
