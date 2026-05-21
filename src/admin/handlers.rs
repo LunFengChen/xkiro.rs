@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetEndpointRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
-        UpdateProxyConfigRequest,
+        AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest, SetEndpointRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRegionRequest, SuccessResponse,
+        UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -165,6 +165,16 @@ pub async fn set_compression_config(
     *state.compression_config.write() = payload.clone();
     tracing::info!("压缩配置已通过 Admin API 更新");
     Json(payload)
+}
+
+/// POST /api/admin/credentials/import-token-json
+/// 批量导入 token.json
+pub async fn import_token_json(
+    State(state): State<AdminState>,
+    Json(payload): Json<ImportTokenJsonRequest>,
+) -> impl IntoResponse {
+    let response = state.service.import_token_json(payload).await;
+    Json(response)
 }
 
 /// POST /api/admin/credentials/:id/region

@@ -215,6 +215,7 @@ pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
     /// 压缩统计信息（仅在启用压缩时有值）
+    #[allow(dead_code)]
     pub compression_stats: Option<CompressionStats>,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,

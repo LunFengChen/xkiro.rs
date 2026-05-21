@@ -9,9 +9,10 @@ use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_cached_balances, get_compression_config, get_credential_balance, get_global_config,
-        get_load_balancing_mode, get_proxy_config, reset_failure_count, set_compression_config,
-        set_credential_disabled, set_credential_endpoint, set_credential_priority,
-        set_credential_region, set_load_balancing_mode, update_global_config, update_proxy_config,
+        get_load_balancing_mode, get_proxy_config, import_token_json, reset_failure_count,
+        set_compression_config, set_credential_disabled, set_credential_endpoint,
+        set_credential_priority, set_credential_region, set_load_balancing_mode,
+        update_global_config, update_proxy_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -22,6 +23,7 @@ use super::{
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
 /// - `GET /credentials/balances/cached` - 获取所有凭据的缓存余额
+/// - `POST /credentials/import-token-json` - 批量导入 token.json
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
@@ -50,6 +52,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/balances/cached", get(get_cached_balances))
+        .route(
+            "/credentials/import-token-json",
+            post(import_token_json),
+        )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))

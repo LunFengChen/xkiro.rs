@@ -22,6 +22,7 @@ use super::types::ErrorResponse;
 #[derive(Clone)]
 pub(crate) struct PromptCacheSnapshot {
     pub accounting_enabled: bool,
+    #[allow(dead_code)]
     pub ttl_seconds: u64,
     pub tracker: Arc<CacheTracker>,
 }
