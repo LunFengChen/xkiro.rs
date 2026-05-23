@@ -188,10 +188,6 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
-    #[serde(default = "default_load_balancing_mode")]
-    pub load_balancing_mode: String,
-
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -221,6 +217,28 @@ pub struct Config {
     /// 是否启用本地 Prompt Cache usage 记账，默认 true
     #[serde(default = "default_true")]
     pub prompt_cache_accounting_enabled: bool,
+
+    /// 单凭据最大并发请求数（默认 1）
+    ///
+    /// 同一凭据在任意时刻最多同时承载多少个上游 API 调用。设为 1 表示
+    /// 严格串行，避免 Kiro 上游对单账号的速率/并发风险；增大后允许同账号
+    /// 并行，但上游限流命中概率上升。
+    #[serde(default = "default_per_credential_concurrency")]
+    pub per_credential_concurrency: usize,
+
+    /// 全局最大并发请求数（默认 0，表示不限）
+    ///
+    /// 跨所有凭据的总并发上限。0 = 不启用全局限流；> 0 时优先在全局闸门排队，
+    /// 通过后再到对应凭据的 per-credential 闸门排队。
+    #[serde(default = "default_global_concurrency")]
+    pub global_concurrency: usize,
+
+    /// 排队等待 permit 的超时秒数（默认 60）
+    ///
+    /// 请求进入凭据队列后若在此时间内仍未获得 permit，将以 429 overloaded_error
+    /// 返回，避免客户端无限等待。
+    #[serde(default = "default_acquire_wait_timeout_secs")]
+    pub acquire_wait_timeout_secs: u64,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -260,16 +278,24 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
-fn default_load_balancing_mode() -> String {
-    "priority".to_string()
-}
-
 fn default_extract_thinking() -> bool {
     true
 }
 
 fn default_prompt_cache_ttl_seconds() -> u64 {
     300
+}
+
+fn default_per_credential_concurrency() -> usize {
+    1
+}
+
+fn default_global_concurrency() -> usize {
+    0
+}
+
+fn default_acquire_wait_timeout_secs() -> u64 {
+    60
 }
 
 fn default_endpoint() -> String {
@@ -297,13 +323,15 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
-            load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),
+            per_credential_concurrency: default_per_credential_concurrency(),
+            global_concurrency: default_global_concurrency(),
+            acquire_wait_timeout_secs: default_acquire_wait_timeout_secs(),
             config_path: None,
         }
     }

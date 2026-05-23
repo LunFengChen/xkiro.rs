@@ -28,6 +28,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
+  const [concurrency, setConcurrency] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -45,6 +46,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientId('')
     setClientSecret('')
     setPriority('0')
+    setConcurrency('')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -85,6 +87,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
+        concurrency: concurrency.trim() === '' ? null : (parseInt(concurrency) || null),
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -240,6 +243,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            {/* 独立并发 */}
+            <div className="space-y-2">
+              <label htmlFor="concurrency" className="text-sm font-medium">
+                独立并发
+              </label>
+              <Input
+                id="concurrency"
+                type="number"
+                min="1"
+                placeholder="留空使用全局回退"
+                value={concurrency}
+                onChange={(e) => setConcurrency(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，正整数；留空时该凭据并发回退到全局 perCredentialConcurrency
               </p>
             </div>
 

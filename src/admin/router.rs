@@ -7,12 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_cached_balances, get_compression_config, get_credential_balance, get_global_config,
-        get_load_balancing_mode, get_proxy_config, import_token_json, reset_failure_count,
-        set_compression_config, set_credential_disabled, set_credential_endpoint,
-        set_credential_priority, set_credential_region, set_load_balancing_mode,
-        update_global_config, update_proxy_config,
+        add_credential, delete_credential, force_refresh_balances_batch, force_refresh_token,
+        force_refresh_tokens_batch, get_all_credentials, get_cached_balances,
+        get_compression_config, get_credential_balance, get_global_config, get_proxy_config,
+        get_runtime_stats, import_token_json, reset_failure_count, set_compression_config,
+        set_credential_concurrency, set_credential_disabled, set_credential_endpoint,
+        set_credential_priority, set_credential_region, update_global_config, update_proxy_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -32,8 +32,8 @@ use super::{
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `POST /credentials/:id/region` - 设置凭据 Region
 /// - `POST /credentials/:id/endpoint` - 设置凭据 endpoint
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /credentials/runtime-stats` - 获取所有凭据运行时状态（K/N + lastUsed 内存快照）
+/// - `POST /credentials/refresh-batch` - 批量强制刷新 Token（后端并发，单次往返）
 /// - `GET /config/compression` - 获取压缩配置
 /// - `PUT /config/compression` - 更新压缩配置
 /// - `GET /config/global` - 获取全局配置
@@ -59,14 +59,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/concurrency", post(set_credential_concurrency))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/region", post(set_credential_region))
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
+        .route("/credentials/runtime-stats", get(get_runtime_stats))
         .route(
-            "/config/load-balancing",
-            get(get_load_balancing_mode).put(set_load_balancing_mode),
+            "/credentials/refresh-batch",
+            post(force_refresh_tokens_batch),
+        )
+        .route(
+            "/credentials/refresh-balances-batch",
+            post(force_refresh_balances_batch),
         )
         .route(
             "/config/compression",

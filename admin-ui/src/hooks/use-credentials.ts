@@ -3,13 +3,12 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialConcurrency,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
   addCredential,
   deleteCredential,
-  getLoadBalancingMode,
-  setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -56,6 +55,18 @@ export function useSetPriority() {
   })
 }
 
+// 设置单凭据最大并发（null = 使用全局回退）
+export function useSetCredentialConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, concurrency }: { id: number; concurrency: number | null }) =>
+      setCredentialConcurrency(id, concurrency),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 // 重置失败计数
 export function useResetFailure() {
   const queryClient = useQueryClient()
@@ -96,25 +107,6 @@ export function useDeleteCredential() {
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    },
-  })
-}
-
-// 获取负载均衡模式
-export function useLoadBalancingMode() {
-  return useQuery({
-    queryKey: ['loadBalancingMode'],
-    queryFn: getLoadBalancingMode,
-  })
-}
-
-// 设置负载均衡模式
-export function useSetLoadBalancingMode() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: setLoadBalancingMode,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
 }

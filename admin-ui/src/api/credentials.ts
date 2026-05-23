@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetConcurrencyRequest,
   AddCredentialRequest,
   AddCredentialResponse,
 } from '@/types/api'
@@ -57,6 +58,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置凭据并发上限（null = 跟随全局）
+export async function setCredentialConcurrency(
+  id: number,
+  concurrency: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/concurrency`,
+    { concurrency } as SetConcurrencyRequest
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -93,18 +106,6 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
-// 获取负载均衡模式
-export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')
-  return data
-}
-
-// 设置负载均衡模式
-export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
-  const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
-  return data
-}
-
 // 压缩配置类型
 export interface CompressionConfig {
   enabled: boolean
@@ -133,5 +134,47 @@ export async function getCompressionConfig(): Promise<CompressionConfig> {
 // 更新压缩配置
 export async function setCompressionConfig(config: CompressionConfig): Promise<CompressionConfig> {
   const { data } = await api.put<CompressionConfig>('/config/compression', config)
+  return data
+}
+
+// 获取全局配置
+export async function getGlobalConfig(): Promise<import('../types/api').GlobalConfigResponse> {
+  const { data } = await api.get<import('../types/api').GlobalConfigResponse>('/config/global')
+  return data
+}
+
+// 更新全局配置
+export async function updateGlobalConfig(
+  req: import('../types/api').UpdateGlobalConfigRequest,
+): Promise<import('../types/api').GlobalConfigResponse> {
+  const { data } = await api.put<import('../types/api').GlobalConfigResponse>('/config/global', req)
+  return data
+}
+
+// 获取运行时状态（K/N + lastUsed，5s 高频轮询）
+export async function getRuntimeStats(): Promise<import('../types/api').RuntimeStatsResponse> {
+  const { data } = await api.get<import('../types/api').RuntimeStatsResponse>('/credentials/runtime-stats')
+  return data
+}
+
+// 批量强制刷新 Token（服务端 Semaphore(8) 并发，前端一次往返）
+export async function refreshBatch(
+  ids: number[],
+): Promise<import('../types/api').BatchRefreshResponse> {
+  const { data } = await api.post<import('../types/api').BatchRefreshResponse>(
+    '/credentials/refresh-batch',
+    { ids } as import('../types/api').BatchRefreshRequest,
+  )
+  return data
+}
+
+// 批量查询余额（服务端 Semaphore(8) 并发，前端一次往返）
+export async function refreshBalancesBatch(
+  ids: number[],
+): Promise<import('../types/api').BatchRefreshBalanceResponse> {
+  const { data } = await api.post<import('../types/api').BatchRefreshBalanceResponse>(
+    '/credentials/refresh-balances-batch',
+    { ids } as import('../types/api').BatchRefreshRequest,
+  )
   return data
 }

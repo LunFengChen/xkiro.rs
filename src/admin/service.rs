@@ -15,15 +15,18 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::CompressionConfig;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CachedBalanceItem,
-    CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
+    BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
+    CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
     CredentialsStatusResponse, GlobalConfigResponse, ImportAction, ImportItemResult,
-    ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, LoadBalancingModeResponse,
-    ProxyConfigResponse, SetLoadBalancingModeRequest, TokenJsonItem,
-    UpdateCompressionConfigRequest, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+    ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, ProxyConfigResponse,
+    RuntimeStatsItem, RuntimeStatsResponse, TokenJsonItem, UpdateCompressionConfigRequest,
+    UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
 };
 use crate::kiro::token_manager::CachedBalanceInfo;
 
@@ -54,6 +57,12 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 余额查询并发限流（单条 + 批量共享同一信号量）
+    ///
+    /// 单条 `fetch_balance` 与批量 `force_refresh_balances_batch` 都从这里获取
+    /// 许可，确保系统级别上对单凭据池的余额上游调用并发不会失控。
+    /// 容量 8 与历史批量 Semaphore 等价。
+    balance_semaphore: Arc<Semaphore>,
 }
 
 impl AdminService {
@@ -78,6 +87,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            balance_semaphore: Arc::new(Semaphore::new(8)),
         }
     }
 
@@ -109,6 +119,9 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                available_permits: entry.available_permits,
+                max_permits: entry.max_permits,
+                concurrency: entry.concurrency,
             })
             .collect();
 
@@ -144,6 +157,17 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置单凭据独立并发上限（None=回退到全局 per_credential_concurrency）
+    pub fn set_concurrency(
+        &self,
+        id: u64,
+        concurrency: Option<u32>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_concurrency(id, concurrency)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -188,7 +212,34 @@ impl AdminService {
     }
 
     /// 从上游获取余额（无缓存）
+    ///
+    /// 异步队列设计：
+    /// 1. 先查 snapshot：disabled 凭据直接返回 `InvalidCredential`，不进队列
+    /// 2. 通过 `balance_semaphore` 限流（与批量刷新共享，全局并发上限 8）
+    /// 3. 拿到 permit 后调用 `get_usage_limits_for`；permit 在函数返回时自动释放
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        // disabled 凭据快速失败：不占用队列槽位
+        let snapshot = self.token_manager.snapshot();
+        if let Some(entry) = snapshot.entries.iter().find(|e| e.id == id) {
+            if entry.disabled {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "credential {id} disabled"
+                )));
+            }
+        } else {
+            return Err(AdminServiceError::NotFound { id });
+        }
+
+        // 进入余额查询队列：拿到 permit 才能继续，超出并发的请求在此排队
+        let _permit = self
+            .balance_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                AdminServiceError::InternalError(format!("acquire balance semaphore failed: {e}"))
+            })?;
+
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -306,6 +357,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            concurrency: req.concurrency,
         };
 
         // 调用 token_manager 添加凭据
@@ -344,38 +396,252 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取负载均衡模式
-    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
-        LoadBalancingModeResponse {
-            mode: self.token_manager.get_load_balancing_mode(),
-        }
-    }
-
-    /// 设置负载均衡模式
-    pub fn set_load_balancing_mode(
-        &self,
-        req: SetLoadBalancingModeRequest,
-    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
-            return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        Ok(LoadBalancingModeResponse { mode: req.mode })
-    }
-
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 轻量运行时状态快照（高频轮询用，纯内存读取，不触发任何 IO）
+    ///
+    /// 字段精简至 dashboard 实时需要的 5 项：
+    /// - `id`：凭据主键
+    /// - `last_used_at`：最近一次被选中的时间戳（RFC3339）
+    /// - `available_permits` / `max_permits`：用于渲染 K/N 并发占用
+    /// - `disabled`：手动禁用标记
+    pub fn get_runtime_stats(&self) -> RuntimeStatsResponse {
+        let snapshot = self.token_manager.snapshot();
+        let credentials = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| RuntimeStatsItem {
+                id: entry.id,
+                last_used_at: entry.last_used_at.clone(),
+                available_permits: entry.available_permits,
+                max_permits: entry.max_permits,
+                disabled: entry.disabled,
+            })
+            .collect();
+        RuntimeStatsResponse { credentials }
+    }
+
+    /// 批量强制刷新 Token（B 端点）
+    ///
+    /// 用 `Semaphore(8)` 限制并发，`JoinSet` 收集结果。
+    /// 单个失败不影响其他凭据，全部完成后返回 `BatchRefreshResponse`。
+    /// 内部调用 `force_refresh_token_for(id)`，对 API Key 凭据会 `bail` 走 Err 分支。
+    pub async fn force_refresh_tokens_batch(&self, ids: Vec<u64>) -> BatchRefreshResponse {
+        // 源头过滤：禁用的凭据直接跳过刷新，不占用并发槽位
+        let snapshot = self.token_manager.snapshot();
+        let disabled_ids: HashSet<u64> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.disabled)
+            .map(|e| e.id)
+            .collect();
+        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) = ids
+            .into_iter()
+            .partition(|id| !disabled_ids.contains(id));
+
+        let semaphore = Arc::new(Semaphore::new(8));
+        let mut tasks: JoinSet<BatchRefreshResultItem> = JoinSet::new();
+
+        for id in active_ids {
+            let token_manager = self.token_manager.clone();
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                // 获取并发许可（最多 8 个并发刷新）
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return BatchRefreshResultItem {
+                            id,
+                            success: false,
+                            error: Some(format!("acquire semaphore failed: {e}")),
+                        };
+                    }
+                };
+                match token_manager.force_refresh_token_for(id).await {
+                    Ok(()) => BatchRefreshResultItem {
+                        id,
+                        success: true,
+                        error: None,
+                    },
+                    Err(e) => BatchRefreshResultItem {
+                        id,
+                        success: false,
+                        error: Some(e.to_string()),
+                    },
+                }
+            });
+        }
+
+        let mut results = Vec::new();
+        let mut success_count = 0usize;
+        let mut failure_count = skipped_ids.len();
+        // 禁用条目直接构造失败项加入结果集
+        for id in skipped_ids {
+            results.push(BatchRefreshResultItem {
+                id,
+                success: false,
+                error: Some("credential disabled".to_string()),
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(item) => {
+                    if item.success {
+                        success_count += 1;
+                    } else {
+                        failure_count += 1;
+                    }
+                    results.push(item);
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    results.push(BatchRefreshResultItem {
+                        id: 0,
+                        success: false,
+                        error: Some(format!("task join error: {e}")),
+                    });
+                }
+            }
+        }
+        // 按 id 升序便于前端展示
+        results.sort_by_key(|r| r.id);
+
+        BatchRefreshResponse {
+            results,
+            success_count,
+            failure_count,
+        }
+    }
+
+    /// 批量强制刷新余额（不入缓存）
+    ///
+    /// 用 `Semaphore(8)` 限制并发，`JoinSet` 收集结果。
+    /// 单个失败不影响其他凭据，全部完成后返回 `BatchRefreshBalanceResponse`。
+    /// 内部直接调用 `token_manager.get_usage_limits_for(id)` 获取最新值，
+    /// 不写入余额缓存（与单条 force-refresh 余额端点不同，避免大批量回写抖动）。
+    pub async fn force_refresh_balances_batch(
+        &self,
+        ids: Vec<u64>,
+    ) -> BatchRefreshBalanceResponse {
+        // 源头过滤：禁用的凭据直接跳过查询，不占用并发槽位
+        let snapshot = self.token_manager.snapshot();
+        let disabled_ids: HashSet<u64> = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.disabled)
+            .map(|e| e.id)
+            .collect();
+        let (active_ids, skipped_ids): (Vec<u64>, Vec<u64>) = ids
+            .into_iter()
+            .partition(|id| !disabled_ids.contains(id));
+
+        // 与单条 fetch_balance 共享同一个全局余额查询 Semaphore（容量 8），
+        // 避免批量刷新与零散查询互相抢占
+        let semaphore = self.balance_semaphore.clone();
+        let mut tasks: JoinSet<BatchRefreshBalanceResultItem> = JoinSet::new();
+
+        for id in active_ids {
+            let token_manager = self.token_manager.clone();
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                // 获取并发许可（最多 8 个并发查询）
+                let _permit = match semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return BatchRefreshBalanceResultItem {
+                            id,
+                            success: false,
+                            balance: None,
+                            error: Some(format!("acquire semaphore failed: {e}")),
+                        };
+                    }
+                };
+                match token_manager.get_usage_limits_for(id).await {
+                    Ok(usage) => {
+                        // 字段聚合复用 UsageLimitsResponse 的便捷方法，
+                        // 公式与 AdminService::fetch_balance 保持一致
+                        let current_usage = usage.current_usage();
+                        let usage_limit = usage.usage_limit();
+                        let remaining = (usage_limit - current_usage).max(0.0);
+                        let usage_percentage = if usage_limit > 0.0 {
+                            (current_usage / usage_limit * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        BatchRefreshBalanceResultItem {
+                            id,
+                            success: true,
+                            balance: Some(BalanceResponse {
+                                id,
+                                subscription_title: usage
+                                    .subscription_title()
+                                    .map(|s| s.to_string()),
+                                current_usage,
+                                usage_limit,
+                                remaining,
+                                usage_percentage,
+                                next_reset_at: usage.next_date_reset,
+                            }),
+                            error: None,
+                        }
+                    }
+                    Err(e) => BatchRefreshBalanceResultItem {
+                        id,
+                        success: false,
+                        balance: None,
+                        error: Some(e.to_string()),
+                    },
+                }
+            });
+        }
+
+        let mut results = Vec::new();
+        let mut success_count = 0usize;
+        let mut failure_count = skipped_ids.len();
+        // 禁用条目直接构造失败项加入结果集
+        for id in skipped_ids {
+            results.push(BatchRefreshBalanceResultItem {
+                id,
+                success: false,
+                balance: None,
+                error: Some("credential disabled".to_string()),
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(item) => {
+                    if item.success {
+                        success_count += 1;
+                    } else {
+                        failure_count += 1;
+                    }
+                    results.push(item);
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    results.push(BatchRefreshBalanceResultItem {
+                        id: 0,
+                        success: false,
+                        balance: None,
+                        error: Some(format!("task join error: {e}")),
+                    });
+                }
+            }
+        }
+        // 按 id 升序便于前端展示
+        results.sort_by_key(|r| r.id);
+
+        BatchRefreshBalanceResponse {
+            results,
+            success_count,
+            failure_count,
+        }
     }
 
     // ============ 余额缓存持久化 ============
@@ -645,6 +911,9 @@ impl AdminService {
             prompt_cache_accounting_enabled: config.prompt_cache_accounting_enabled,
             default_endpoint: config.default_endpoint.clone(),
             extract_thinking: config.extract_thinking,
+            per_credential_concurrency: config.per_credential_concurrency,
+            global_concurrency: config.global_concurrency,
+            acquire_wait_timeout_secs: config.acquire_wait_timeout_secs,
             compression: CompressionConfigResponse {
                 enabled: c.enabled,
                 whitespace_compression: c.whitespace_compression,
@@ -666,10 +935,19 @@ impl AdminService {
     }
 
     /// 更新全局配置（热更新）
+    ///
+    /// 返回更新后的 `GlobalConfigResponse`，前端拿到即可直接渲染，避免
+    /// 再发一次 GET 请求；与 `get_global_config()` 同形。
     pub async fn update_global_config(
         &self,
         req: UpdateGlobalConfigRequest,
-    ) -> Result<(), AdminServiceError> {
+    ) -> Result<GlobalConfigResponse, AdminServiceError> {
+        // 0. 先抓写前快照：用于后续传给 setter。
+        //    必须在 with_config_mut 之前抓，否则会读到闭包刚写入的新值，
+        //    setter 内部 old==new 时会触发 noop（bug-B 根因）。
+        let old_per_credential = self.token_manager.config().per_credential_concurrency;
+        let old_global = self.token_manager.config().global_concurrency;
+
         // 1. 先持久化配置（失败时不影响运行时状态）
         self.token_manager.with_config_mut(|cfg| {
             if let Some(region) = &req.region {
@@ -722,6 +1000,28 @@ impl AdminService {
                 Self::apply_compression_fields(&mut cfg.compression, c);
             }
 
+            // 凭据队列等待超时（秒）：无单独 setter，运行时 acquire 路径每次读 config 即生效
+            if let Some(v) = req.acquire_wait_timeout_secs {
+                cfg.acquire_wait_timeout_secs = v;
+            }
+
+            // 单凭据最大并发数 0 无意义（setter 内部也会 bail），提前拦截返回 400。
+            // 注：setter 已改双参（old, new），old 由函数顶部 snapshot 传入，
+            // 故此处可放心写 cfg —— setter 不再读 config，写入时机不影响 setter。
+            if let Some(v) = req.per_credential_concurrency {
+                if v == 0 {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "单凭据最大并发数不能为 0".to_string(),
+                    ));
+                }
+                cfg.per_credential_concurrency = v;
+            }
+
+            // 全局最大并发数：0 表示不限，合法
+            if let Some(v) = req.global_concurrency {
+                cfg.global_concurrency = v;
+            }
+
             cfg.save()
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))
         })?;
@@ -766,7 +1066,22 @@ impl AdminService {
             Self::apply_compression_fields(&mut runtime, c);
         }
 
-        Ok(())
+        // 热更新单凭据最大并发数（0 不允许，setter 内部 bail）
+        // old 由函数顶部 snapshot 传入，setter 内部不读 config，避免 noop。
+        if let Some(v) = req.per_credential_concurrency {
+            self.token_manager
+                .set_per_credential_concurrency(old_per_credential, v)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        // 热更新全局并发数（0 表示不限）
+        if let Some(v) = req.global_concurrency {
+            self.token_manager
+                .set_global_concurrency(old_global, v)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        Ok(self.get_global_config())
     }
 
     /// 将更新请求中的压缩字段应用到目标 CompressionConfig
@@ -952,6 +1267,7 @@ impl AdminService {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            concurrency: None,
         };
 
         match self.token_manager.add_credential(new_cred).await {

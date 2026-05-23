@@ -62,6 +62,13 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 该凭据当前可用的并发许可数（available permits）
+    pub available_permits: usize,
+    /// 凭据级最大并发上限（已下发到 Semaphore 的总许可数）
+    pub max_permits: usize,
+
+    /// 凭据级并发上限配置（None=回退全局 per_credential_concurrency）
+    pub concurrency: Option<u32>,
 }
 
 // ============ 操作请求 ============
@@ -80,6 +87,14 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改单凭据并发上限请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyRequest {
+    /// 凭据级最大并发（>=1，None=回退全局 per_credential_concurrency）
+    pub concurrency: Option<u32>,
 }
 
 /// 修改 region 请求
@@ -120,6 +135,10 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 凭据级最大并发（>=1，None=回退全局 per_credential_concurrency）
+    #[serde(default)]
+    pub concurrency: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -224,24 +243,6 @@ pub struct CachedBalancesResponse {
     pub balances: Vec<CachedBalanceItem>,
 }
 
-// ============ 负载均衡配置 ============
-
-/// 负载均衡模式响应
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
-
-/// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
-}
-
 // ============ 全局代理配置 ============
 
 /// 全局代理配置响应
@@ -277,6 +278,12 @@ pub struct GlobalConfigResponse {
     pub default_endpoint: String,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 单凭据最大并发数（per-credential semaphore，>=1）
+    pub per_credential_concurrency: usize,
+    /// 全局并发上限（global semaphore，0=不限）
+    pub global_concurrency: usize,
+    /// 凭据队列等待超时（秒），超时后返回 429 overloaded_error
+    pub acquire_wait_timeout_secs: u64,
     /// 压缩配置
     pub compression: CompressionConfigResponse,
 }
@@ -316,6 +323,12 @@ pub struct UpdateGlobalConfigRequest {
     pub default_endpoint: Option<String>,
     /// 是否开启非流式响应的 thinking 块提取（可选）
     pub extract_thinking: Option<bool>,
+    /// 单凭据最大并发数（>=1，可选）
+    pub per_credential_concurrency: Option<usize>,
+    /// 全局并发上限（0=不限，可选）
+    pub global_concurrency: Option<usize>,
+    /// 凭据队列等待超时（秒，可选）
+    pub acquire_wait_timeout_secs: Option<u64>,
     /// 压缩配置（可选）
     pub compression: Option<UpdateCompressionConfigRequest>,
 }
@@ -489,4 +502,81 @@ impl AdminErrorResponse {
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
     }
+}
+
+// ============ 运行时状态轻量端点（高频轮询）============
+
+/// 单个凭据的运行时状态（仅内存快照字段，不含静态元数据）
+///
+/// 用于 `GET /credentials/runtime-stats` 高频轮询（5s），
+/// 与 `CredentialStatusItem` 互补：后者全量字段、低频；前者最小集合、高频。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatsItem {
+    pub id: u64,
+    pub last_used_at: Option<String>,
+    pub available_permits: usize,
+    pub max_permits: usize,
+    pub disabled: bool,
+}
+
+/// 运行时状态响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatsResponse {
+    pub credentials: Vec<RuntimeStatsItem>,
+}
+
+// ============ 批量刷新 Token 端点 ============
+
+/// 批量刷新请求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRefreshRequest {
+    pub ids: Vec<u64>,
+}
+
+/// 单个凭据的刷新结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRefreshResultItem {
+    pub id: u64,
+    pub success: bool,
+    /// 失败原因（success=true 时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量刷新响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRefreshResponse {
+    pub results: Vec<BatchRefreshResultItem>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
+// ============ 批量刷新余额端点 ============
+
+/// 单个凭据的余额刷新结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRefreshBalanceResultItem {
+    pub id: u64,
+    pub success: bool,
+    /// 成功时的余额信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceResponse>,
+    /// 失败原因（success=true 时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量刷新余额响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRefreshBalanceResponse {
+    pub results: Vec<BatchRefreshBalanceResultItem>,
+    pub success_count: usize,
+    pub failure_count: usize,
 }

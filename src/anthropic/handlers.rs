@@ -234,6 +234,17 @@ fn is_improperly_formed_request_error(err: &Error) -> bool {
     s.contains("Improperly formed request")
 }
 
+/// 判断是否是凭据队列等待超时错误（per-credential 并发限流命中后等待超时）
+///
+/// `wait_any_credential` 在所有候选凭据都达到并发上限、且全员排队仍超过
+/// `acquireWaitTimeoutSecs` 时，会返回固定 sentinel 字符串 "credential queue wait timeout"。
+/// 此类错误属于服务侧暂时过载，应返回 429 overloaded_error 让客户端做退避重试，
+/// 而非 5xx 普通故障（避免 panic）也不应当作 quota_exhausted（含义不同）。
+fn is_credential_queue_timeout_error(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("credential queue wait timeout")
+}
+
 
 /// 计算 KiroRequest 中所有图片 base64 数据的总字节数。
 ///
@@ -510,6 +521,18 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             Json(ErrorResponse::new(
                 "service_unavailable",
                 "No credentials available. Please add or enable credentials via Admin API or credentials.json.",
+            )),
+        )
+            .into_response();
+    }
+
+    if is_credential_queue_timeout_error(&err) {
+        tracing::warn!(error = %err, "凭据队列等待超时（per-credential 并发已满）");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "All credentials are busy. Please retry shortly.",
             )),
         )
             .into_response();
@@ -2238,5 +2261,19 @@ mod tests {
             anyhow::anyhow!("400 Improperly formed request"),
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// 凭据队列等待超时 → 429 overloaded_error
+    ///
+    /// 验证 `wait_any_credential` 抛出的 sentinel 字符串
+    /// `"credential queue wait timeout"` 能被 `is_credential_queue_timeout_error`
+    /// 正确识别并映射为 429 + overloaded_error，让客户端做指数退避重试。
+    #[test]
+    fn test_credential_queue_timeout_maps_to_429_overloaded() {
+        let response = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("credential queue wait timeout"),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

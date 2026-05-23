@@ -13,8 +13,9 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
+import { useRuntimeStats } from '@/hooks/use-runtime-stats'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -40,6 +41,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [batchQueryingBalance, setBatchQueryingBalance] = useState(false)
+  const [batchQueryBalanceProgress, setBatchQueryBalanceProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -58,14 +61,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: runtimeMap } = useRuntimeStats()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  // 切片后逐元素 merge runtimeMap 的实时字段（K/N + lastUsedAt + disabled）
+  const currentCredentials = (data?.credentials.slice(startIndex, endIndex) || []).map(credential => {
+    const runtime = runtimeMap?.get(credential.id)
+    if (!runtime) return credential
+    return {
+      ...credential,
+      lastUsedAt: runtime.lastUsedAt,
+      availablePermits: runtime.availablePermits,
+      maxPermits: runtime.maxPermits,
+      disabled: runtime.disabled,
+    }
+  })
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
@@ -283,26 +296,69 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setBatchRefreshing(true)
     setBatchRefreshProgress({ current: 0, total: enabledIds.length })
 
-    let successCount = 0
-    let failCount = 0
+    try {
+      const resp = await refreshBatch(enabledIds)
+      setBatchRefreshProgress({ current: enabledIds.length, total: enabledIds.length })
 
-    for (let i = 0; i < enabledIds.length; i++) {
-      try {
-        await forceRefreshToken(enabledIds[i])
-        successCount++
-      } catch {
-        failCount++
+      if (resp.failureCount === 0) {
+        toast.success(`成功刷新 ${resp.successCount} 个凭据的 Token`)
+      } else {
+        toast.warning(`刷新 Token：成功 ${resp.successCount} 个，失败 ${resp.failureCount} 个`)
       }
-      setBatchRefreshProgress({ current: i + 1, total: enabledIds.length })
+    } catch (error) {
+      toast.error(`批量刷新失败：${extractErrorMessage(error)}`)
+    } finally {
+      setBatchRefreshing(false)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     }
 
-    setBatchRefreshing(false)
-    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    deselectAll()
+  }
 
-    if (failCount === 0) {
-      toast.success(`成功刷新 ${successCount} 个凭据的 Token`)
-    } else {
-      toast.warning(`刷新 Token：成功 ${successCount} 个，失败 ${failCount} 个`)
+  // 批量查询余额（服务端 Semaphore(8) 并发，前端一次往返；成功项回填到 balanceMap 复用 BalanceDialog 数据）
+  const handleBatchQueryBalance = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要查询的凭据')
+      return
+    }
+
+    const enabledIds = Array.from(selectedIds).filter(id => {
+      const cred = data?.credentials.find(c => c.id === id)
+      return cred && !cred.disabled
+    })
+
+    if (enabledIds.length === 0) {
+      toast.error('选中的凭据中没有启用的凭据')
+      return
+    }
+
+    setBatchQueryingBalance(true)
+    setBatchQueryBalanceProgress({ current: 0, total: enabledIds.length })
+
+    try {
+      const resp = await refreshBalancesBatch(enabledIds)
+      setBatchQueryBalanceProgress({ current: enabledIds.length, total: enabledIds.length })
+
+      // 成功项合入 balanceMap（复用单凭证查询的展示链路）
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        resp.results.forEach(item => {
+          if (item.success && item.balance) {
+            next.set(item.id, item.balance)
+          }
+        })
+        return next
+      })
+
+      if (resp.failureCount === 0) {
+        toast.success(`成功查询 ${resp.successCount} 个凭据的余额`)
+      } else {
+        toast.warning(`查询余额：成功 ${resp.successCount} 个，失败 ${resp.failureCount} 个`)
+      }
+    } catch (error) {
+      toast.error(`批量查询余额失败：${extractErrorMessage(error)}`)
+    } finally {
+      setBatchQueryingBalance(false)
     }
 
     deselectAll()
@@ -508,22 +564,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
-
-    setLoadBalancingMode(newMode, {
-      onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
-        toast.success(`已切换到${modeName}`)
-      },
-      onError: (error) => {
-        toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
-    })
-  }
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -562,15 +602,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
-            >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -590,7 +621,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-2 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -609,19 +640,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
             </CardContent>
           </Card>
         </div>
@@ -655,6 +673,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
                     {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
+                  </Button>
+                  <Button
+                    onClick={handleBatchQueryBalance}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchQueryingBalance}
+                  >
+                    <RefreshCw className={`h-4 w-4 mr-2 ${batchQueryingBalance ? 'animate-spin' : ''}`} />
+                    {batchQueryingBalance ? `查询中... ${batchQueryBalanceProgress.current}/${batchQueryBalanceProgress.total}` : '批量查询信息'}
                   </Button>
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />

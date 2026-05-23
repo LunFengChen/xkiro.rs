@@ -51,6 +51,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 凭据级最大并发数（可选）
+    ///
+    /// 未配置时回退到 `config.perCredentialConcurrency` 全局值。
+    /// 取值至少为 1，0 视为非法（运行时由 set_credential_concurrency 校验）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,6 +352,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -462,6 +471,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            concurrency: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -493,6 +503,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 0,
+            concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -607,6 +618,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             priority: 3,
+            concurrency: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,

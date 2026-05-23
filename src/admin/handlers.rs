@@ -9,9 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest, SetEndpointRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetRegionRequest, SuccessResponse,
-        UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+        AddCredentialRequest, BatchRefreshRequest, ImportTokenJsonRequest, SetConcurrencyRequest,
+        SetDisabledRequest, SetEndpointRequest, SetPriorityRequest, SetRegionRequest,
+        SuccessResponse, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -58,6 +58,25 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+/// 设置单凭据独立并发上限（None=回退全局）
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_concurrency(id, payload.concurrency) {
+        Ok(_) => {
+            let msg = match payload.concurrency {
+                Some(n) => format!("凭据 #{} 独立并发上限已设置为 {}", id, n),
+                None => format!("凭据 #{} 已恢复使用全局并发上限", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -126,25 +145,6 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/load-balancing
-/// 获取负载均衡模式
-pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_load_balancing_mode();
-    Json(response)
-}
-
-/// PUT /api/admin/config/load-balancing
-/// 设置负载均衡模式
-pub async fn set_load_balancing_mode(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetLoadBalancingModeRequest>,
-) -> impl IntoResponse {
-    match state.service.set_load_balancing_mode(payload) {
-        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -241,7 +241,32 @@ pub async fn update_global_config(
     Json(req): Json<UpdateGlobalConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.update_global_config(req).await {
-        Ok(_) => Json(SuccessResponse::new("全局配置已更新")).into_response(),
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+
+/// GET /api/admin/credentials/runtime-stats
+/// 轻量运行时状态：返回每个凭据的并发占用 K/N + last_used_at（5s 轮询）
+pub async fn get_runtime_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_runtime_stats()).into_response()
+}
+
+/// POST /api/admin/credentials/refresh-batch
+/// 批量刷新 Token：服务端 Semaphore(8) 并发，前端一次往返
+pub async fn force_refresh_tokens_batch(
+    State(state): State<AdminState>,
+    Json(req): Json<BatchRefreshRequest>,
+) -> impl IntoResponse {
+    Json(state.service.force_refresh_tokens_batch(req.ids).await).into_response()
+}
+
+/// POST /api/admin/credentials/refresh-balances-batch
+/// 批量刷新余额：服务端 Semaphore(8) 并发，前端一次往返
+pub async fn force_refresh_balances_batch(
+    State(state): State<AdminState>,
+    Json(req): Json<BatchRefreshRequest>,
+) -> impl IntoResponse {
+    Json(state.service.force_refresh_balances_batch(req.ids).await).into_response()
+}
+

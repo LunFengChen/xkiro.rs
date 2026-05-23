@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -19,6 +19,7 @@ import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetCredentialConcurrency,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -59,10 +60,25 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState(
+    credential.concurrency == null ? '' : String(credential.concurrency)
+  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+
+  // n4: 让「最后调用时间」相对时间动态刷新
+  // formatLastUsed 内部 new Date() 取的是渲染时刻，所以只要触发组件重渲染就能滚动。
+  // 这里用一个轻量 tick state，每 30s 触发一次 setState 强制重渲染；
+  // 与 runtime-stats 1.5s 轮询解耦，避免每次接口返回都把所有卡片掀一遍。
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const timer = setInterval(() => setTick((t) => t + 1), 30_000)
+    return () => clearInterval(timer)
+  }, [])
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setConcurrency = useSetCredentialConcurrency()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -93,6 +109,42 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message)
           setEditingPriority(false)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleConcurrencyChange = () => {
+    const trimmed = concurrencyValue.trim()
+    if (trimmed === '') {
+      setConcurrency.mutate(
+        { id: credential.id, concurrency: null },
+        {
+          onSuccess: (res) => {
+            toast.success(res.message)
+            setEditingConcurrency(false)
+          },
+          onError: (err) => {
+            toast.error('操作失败: ' + (err as Error).message)
+          },
+        }
+      )
+      return
+    }
+    const n = parseInt(trimmed, 10)
+    if (isNaN(n) || n < 1) {
+      toast.error('独立并发必须为正整数或留空')
+      return
+    }
+    setConcurrency.mutate(
+      { id: credential.id, concurrency: n },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingConcurrency(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -231,6 +283,51 @@ export function CredentialCard({
               )}
             </div>
             <div>
+              <span className="text-muted-foreground">独立并发：</span>
+              {editingConcurrency ? (
+                <div className="inline-flex items-center gap-1 ml-1">
+                  <Input
+                    type="number"
+                    value={concurrencyValue}
+                    onChange={(e) => setConcurrencyValue(e.target.value)}
+                    className="w-20 h-7 text-sm"
+                    min="1"
+                    placeholder="留空回退"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={handleConcurrencyChange}
+                    disabled={setConcurrency.isPending}
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingConcurrency(false)
+                      setConcurrencyValue(
+                        credential.concurrency == null ? '' : String(credential.concurrency)
+                      )
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingConcurrency(true)}
+                >
+                  {credential.concurrency == null ? '全局回退' : credential.concurrency}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
+            <div>
               <span className="text-muted-foreground">失败次数：</span>
               <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
                 {credential.failureCount}
@@ -253,6 +350,19 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">并发占用：</span>
+              <span
+                className={
+                  credential.maxPermits > 0 &&
+                  credential.maxPermits - credential.availablePermits >= credential.maxPermits
+                    ? 'font-medium text-amber-500'
+                    : 'font-medium'
+                }
+              >
+                {credential.maxPermits - credential.availablePermits}/{credential.maxPermits}
+              </span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>

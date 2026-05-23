@@ -10,7 +10,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { getCompressionConfig, setCompressionConfig, type CompressionConfig } from '@/api/credentials'
+import {
+  getCompressionConfig,
+  getGlobalConfig,
+  updateGlobalConfig,
+  type CompressionConfig,
+} from '@/api/credentials'
+import type { GlobalConfigResponse, UpdateGlobalConfigRequest } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
 interface SettingsDialogProps {
@@ -48,6 +54,7 @@ const TABS: { id: TabId; label: string; icon: React.ReactNode }[] = [
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [config, setConfig] = useState<CompressionConfig | null>(null)
+  const [globalConfig, setGlobalConfig] = useState<GlobalConfigResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState<TabId>('general')
@@ -59,7 +66,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const loadConfig = async () => {
     setLoading(true)
     try {
-      setConfig(await getCompressionConfig())
+      const [comp, global] = await Promise.all([getCompressionConfig(), getGlobalConfig()])
+      setConfig(comp)
+      setGlobalConfig(global)
     } catch (error) {
       toast.error(`加载配置失败: ${extractErrorMessage(error)}`)
     } finally {
@@ -68,10 +77,30 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   }
 
   const handleSave = async () => {
-    if (!config) return
+    if (!config || !globalConfig) return
+    if (globalConfig.perCredentialConcurrency < 1) {
+      toast.error('单凭据最大并发数不能小于 1')
+      return
+    }
+    if (globalConfig.globalConcurrency < 0) {
+      toast.error('全局并发上限不能为负数')
+      return
+    }
+    if (globalConfig.acquireWaitTimeoutSecs < 1) {
+      toast.error('排队等待超时不能小于 1 秒')
+      return
+    }
     setSaving(true)
     try {
-      setConfig(await setCompressionConfig(config))
+      const payload: UpdateGlobalConfigRequest = {
+        perCredentialConcurrency: globalConfig.perCredentialConcurrency,
+        globalConcurrency: globalConfig.globalConcurrency,
+        acquireWaitTimeoutSecs: globalConfig.acquireWaitTimeoutSecs,
+        compression: config,
+      }
+      const next = await updateGlobalConfig(payload)
+      setGlobalConfig(next)
+      setConfig(next.compression as CompressionConfig)
       toast.success('配置已保存，立即生效')
     } catch (error) {
       toast.error(`保存失败: ${extractErrorMessage(error)}`)
@@ -87,6 +116,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   const update = <K extends keyof CompressionConfig>(key: K, value: CompressionConfig[K]) => {
     setConfig(prev => prev ? { ...prev, [key]: value } : prev)
+  }
+
+  const updateGlobal = <K extends keyof GlobalConfigResponse>(key: K, value: GlobalConfigResponse[K]) => {
+    setGlobalConfig(prev => prev ? { ...prev, [key]: value } : prev)
   }
 
   return (
@@ -139,6 +172,31 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         ]}
                         onChange={v => update('thinkingStrategy', v)}
                       />
+                      {globalConfig && (
+                        <>
+                          <div className="pt-3 mt-2 border-t">
+                            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1">并发限流</div>
+                          </div>
+                          <NumberRow
+                            label="单凭据并发上限"
+                            desc="同一凭据同时处理的最大请求数（>=1）"
+                            value={globalConfig.perCredentialConcurrency}
+                            onChange={v => updateGlobal('perCredentialConcurrency', v)}
+                          />
+                          <NumberRow
+                            label="全局并发上限"
+                            desc="所有凭据合计并发数，0 表示不限"
+                            value={globalConfig.globalConcurrency}
+                            onChange={v => updateGlobal('globalConcurrency', v)}
+                          />
+                          <NumberRow
+                            label="排队超时（秒）"
+                            desc="等待空闲凭据的最大秒数，超时返回 503"
+                            value={globalConfig.acquireWaitTimeoutSecs}
+                            onChange={v => updateGlobal('acquireWaitTimeoutSecs', v)}
+                          />
+                        </>
+                      )}
                     </>
                   )}
 

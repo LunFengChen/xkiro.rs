@@ -8,7 +8,9 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use futures::future::select_all;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -529,6 +531,12 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 当前可用 permit 数（per-cred Semaphore 剩余）
+    pub available_permits: usize,
+    /// 该凭据 permit 容量上限（= 当前 per_credential_concurrency）
+    pub max_permits: usize,
+    /// 凭据级并发配置（None=回退全局 per_credential_concurrency）
+    pub concurrency: Option<u32>,
 }
 
 /// 凭据管理器状态快照
@@ -588,8 +596,6 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
-    /// 负载均衡模式（运行时可修改）
-    load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -605,6 +611,10 @@ pub struct MultiTokenManager {
     global_recovery_time: Mutex<Option<DateTime<Utc>>>,
     /// 后台 Token 刷新任务（启动后由 Drop 自动停止）
     background_refresher: Mutex<Option<Arc<BackgroundRefresher>>>,
+    /// 单凭据并发信号量（按 id 维度限流，permit 数 = config.per_credential_concurrency）
+    credential_semaphores: Mutex<HashMap<u64, Arc<Semaphore>>>,
+    /// 全局并发信号量（None 表示不限，对应 config.global_concurrency = 0）
+    global_semaphore: Mutex<Option<Arc<Semaphore>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -634,7 +644,9 @@ const GLOBAL_DISABLE_RECOVERY_MINUTES: i64 = 5;
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
+///
+/// 注意：持有 Semaphore permit，不可 Clone（permit 不支持 Clone 语义；
+/// Drop 时自动归还配额，调用结束即释放该凭据的并发占用）
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -642,6 +654,10 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 单凭据并发 permit（Drop 时归还该凭据信号量配额）
+    pub(crate) _credential_permit: Option<OwnedSemaphorePermit>,
+    /// 全局并发 permit（Drop 时归还全局信号量配额；None = 未启用全局限流）
+    pub(crate) _global_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl MultiTokenManager {
@@ -758,7 +774,28 @@ impl MultiTokenManager {
             })
             .collect();
 
-        let load_balancing_mode = config.load_balancing_mode.clone();
+        // 按凭据 id 初始化单凭据并发信号量（每个凭据一把 Semaphore）
+        // 配额优先取凭据级 `concurrency`，未设置则回退到全局 `per_credential_concurrency`
+        let per_cred_limit = config.per_credential_concurrency.max(1);
+        let credential_semaphores: HashMap<u64, Arc<Semaphore>> = entries
+            .iter()
+            .map(|e| {
+                let n = e
+                    .credentials
+                    .concurrency
+                    .map(|v| v as usize)
+                    .unwrap_or(per_cred_limit)
+                    .max(1);
+                (e.id, Arc::new(Semaphore::new(n)))
+            })
+            .collect();
+        // 全局并发信号量：global_concurrency=0 表示不启用全局限流（None）
+        let global_semaphore: Option<Arc<Semaphore>> = if config.global_concurrency > 0 {
+            Some(Arc::new(Semaphore::new(config.global_concurrency)))
+        } else {
+            None
+        };
+
         let manager = Self {
             config: RwLock::new(config),
             proxy: RwLock::new(proxy),
@@ -767,7 +804,6 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
-            load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             affinity: UserAffinityManager::new(),
@@ -776,6 +812,8 @@ impl MultiTokenManager {
             selection_rr: AtomicU64::new(0),
             global_recovery_time: Mutex::new(None),
             background_refresher: Mutex::new(None),
+            credential_semaphores: Mutex::new(credential_semaphores),
+            global_semaphore: Mutex::new(global_semaphore),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -837,58 +875,125 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
+    /// 给 acquire_context 用的候选排序：返回按"优先级 / 负载"从高到低排序后的凭据 id 列表。
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    /// 单一加权派送策略：对所有可用凭据按 (priority asc, recent_usage asc, remaining desc) 排序，
+    /// 完全相同则用 selection_rr 轮询兜底。acquire_context 拿到列表后挨个 `try_acquire_owned`，
+    /// 第一个抢到 permit 的就用——这样可以避免"最优凭据被占满 → 全局排队"的退化。
+    fn rank_candidates(&self, model: Option<&str>) -> Vec<u64> {
+        // 1. 过滤可用候选
+        let candidate_ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            let is_opus = model
+                .map(|m| m.to_lowercase().contains("opus"))
+                .unwrap_or(false);
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .filter(|e| !is_opus || e.credentials.supports_opus())
+                .map(|e| e.id)
+                .collect()
+        };
+
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let rr_offset =
+            self.selection_rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+
+        // 2. 单一加权派送：(priority asc, recent_usage asc, remaining desc) + rr tie-break
         let entries = self.entries.lock();
-
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        let cache = self.balance_cache.lock();
+        let mut scored: Vec<(u64, u32, u32, f64)> = candidate_ids
             .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
+            .filter_map(|&id| {
+                let entry = entries.iter().find(|e| e.id == id)?;
+                let priority = entry.credentials.priority;
+                let (recent_usage, remaining) = cache
+                    .get(&id)
+                    .map(|c| (c.recent_usage, c.remaining))
+                    .unwrap_or((0, 0.0));
+                Some((id, priority, recent_usage, remaining))
+            })
+            .collect();
+        drop(cache);
+        drop(entries);
+
+        scored.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        let mut result: Vec<u64> = Vec::with_capacity(scored.len());
+        let mut i = 0;
+        while i < scored.len() {
+            let mut j = i + 1;
+            while j < scored.len()
+                && scored[j].1 == scored[i].1
+                && scored[j].2 == scored[i].2
+                && (scored[j].3 - scored[i].3).abs() < f64::EPSILON
+            {
+                j += 1;
+            }
+            let len = j - i;
+            let start = if len > 0 { rr_offset % len } else { 0 };
+            for k in 0..len {
+                result.push(scored[i + (start + k) % len].0);
+            }
+            i = j;
+        }
+        result
+    }
+
+    /// 在多个候选凭据上同时排队，谁先空出来就用谁。
+    ///
+    /// - 先收集每个 id 的 `Arc<Semaphore>`，构造 `acquire_owned()` future；
+    /// - `select_all` 等任意一个先 ready；
+    /// - 整体套 `tokio::time::timeout`，超时 → `KiroError::CredentialQueueTimeout`。
+    ///
+    /// 注意：此方法只用于 candidates 全部 try_acquire 失败后的"全员排队"分支；
+    /// 主路径仍是 acquire_context 顺序 try_acquire_owned 抢先。
+    async fn wait_any_credential(
+        &self,
+        candidates: &[u64],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(u64, OwnedSemaphorePermit)> {
+        if candidates.is_empty() {
+            anyhow::bail!("no candidate credentials to wait on");
+        }
+
+        // 收集每个候选的 Semaphore Arc（不同时持有 entries 锁，避免锁顺序倒挂）
+        let mut sema_pairs: Vec<(u64, std::sync::Arc<Semaphore>)> = Vec::with_capacity(candidates.len());
+        {
+            let map = self.credential_semaphores.lock();
+            for &id in candidates {
+                if let Some(s) = map.get(&id) {
+                    sema_pairs.push((id, s.clone()));
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
+            }
+        }
+
+        if sema_pairs.is_empty() {
+            anyhow::bail!("no semaphores registered for given candidates");
+        }
+
+        // 构造一组 boxed future：每个 future 绑定其 id，acquire_owned 成功后返回 (id, permit)
+        let futures: Vec<_> = sema_pairs
+            .into_iter()
+            .map(|(id, sema)| {
+                Box::pin(async move {
+                    let permit = sema.acquire_owned().await.map_err(|e| anyhow::anyhow!("semaphore closed: {}", e))?;
+                    Ok::<(u64, OwnedSemaphorePermit), anyhow::Error>((id, permit))
+                })
             })
             .collect();
 
-        if available.is_empty() {
-            return None;
-        }
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        match mode {
-            "balanced" => {
-                // 贴合 BK：在所有可用候选中按 (recent_usage 最小, remaining 最大, rr 兜底) 选最优
-                let candidate_ids: Vec<u64> = available.iter().map(|e| e.id).collect();
-                drop(entries);
-                let id = self.select_best_candidate_id(&candidate_ids)?;
-                let entries = self.entries.lock();
-                let entry = entries.iter().find(|e| e.id == id)?;
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
-            }
+        match tokio::time::timeout(timeout, select_all(futures)).await {
+            Ok((Ok((id, permit)), _idx, _rest)) => Ok((id, permit)),
+            Ok((Err(e), _idx, _rest)) => Err(e),
+            Err(_) => Err(anyhow::anyhow!("credential queue wait timeout")),
         }
     }
 
@@ -920,7 +1025,34 @@ impl MultiTokenManager {
                         .map(|e| e.credentials.clone())
                 };
                 if let Some(creds) = credentials {
-                    if let Ok(ctx) = self.try_ensure_token(bound_id, &creds).await {
+                    // 亲和命中：必须先非阻塞拿到 per-cred permit，否则 fallback 到 acquire_context
+                    // 这样亲和路径不会绕过限流；绑定凭据已满时会自动落到候选排队池里
+                    let sema_opt = {
+                        let map = self.credential_semaphores.lock();
+                        map.get(&bound_id).cloned()
+                    };
+                    if let Some(sema) = sema_opt
+                        && let Ok(per_cred_permit) = sema.try_acquire_owned()
+                        && let Ok(mut ctx) = self.try_ensure_token(bound_id, &creds).await
+                    {
+                        // 拿到 token 后再注入 global permit
+                        let global_arc_opt = { self.global_semaphore.lock().clone() };
+                        let global_permit = if let Some(g) = global_arc_opt {
+                            match g.acquire_owned().await {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    drop(per_cred_permit);
+                                    return Err(anyhow::anyhow!(
+                                        "global semaphore closed: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        ctx._credential_permit = Some(per_cred_permit);
+                        ctx._global_permit = global_permit;
                         self.affinity.touch(user_id);
                         return Ok(ctx);
                     }
@@ -951,6 +1083,10 @@ impl MultiTokenManager {
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
 
+        // 排队等待超时：从 config 动态读取（默认 60s）
+        let timeout_secs = self.config.read().acquire_wait_timeout_secs;
+        let wait_timeout = std::time::Duration::from_secs(timeout_secs);
+
         loop {
             if attempt_count >= max_attempts {
                 anyhow::bail!(
@@ -960,71 +1096,114 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+            // 1. 收集候选（统一加权排序：priority asc, recent_usage asc, remaining desc）
+            let mut candidates = self.rank_candidates(model);
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model);
+            // 候选为空：尝试 TooManyFailures 自愈（等价于重启）
+            if candidates.is_empty() {
+                let mut entries = self.entries.lock();
+                if entries.iter().any(|e| {
+                    e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                }) {
+                    tracing::warn!(
+                        "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                    );
+                    for e in entries.iter_mut() {
+                        if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                            e.disabled = false;
+                            e.disabled_reason = None;
+                            e.failure_count = 0;
                         }
                     }
+                    drop(entries);
+                    candidates = self.rank_candidates(model);
+                }
+            }
 
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+            if candidates.is_empty() {
+                // 注意：available_count() 内部会取 entries 锁，必须在 lock 释放后调用
+                let available = self.available_count();
+                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+            }
+
+            // 2. 按候选顺序尝试 try_acquire_owned（非阻塞，首胜出）
+            //    这样\"最优凭据被占满\"时能立刻跳到次优，避免单点排队退化
+            let mut acquired: Option<(u64, OwnedSemaphorePermit)> = None;
+            for &cid in &candidates {
+                let sema_opt = {
+                    let map = self.credential_semaphores.lock();
+                    map.get(&cid).cloned()
+                };
+                if let Some(sema) = sema_opt
+                    && let Ok(permit) = sema.try_acquire_owned()
+                {
+                    acquired = Some((cid, permit));
+                    break;
+                }
+            }
+
+            // 3. 全部 try_acquire 失败 → 进入"全员排队"分支，等待任一凭据释放
+            let (id, per_cred_permit) = if let Some(pair) = acquired {
+                pair
+            } else {
+                match self.wait_any_credential(&candidates, wait_timeout).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!("等待凭据 permit 失败: {}", e);
+                        return Err(e);
                     }
                 }
             };
 
-            // 尝试获取/刷新 Token
+            // 4. 拿到 per-cred permit 后取 credentials 副本
+            //    注意：等待期间凭据可能被禁用（被踢出 entries），需要防御性检查
+            let credentials = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id && !e.disabled)
+                    .map(|e| e.credentials.clone())
+            };
+            let credentials = match credentials {
+                Some(c) => c,
+                None => {
+                    // 等待期间凭据被禁用 → 释放 permit 重新选择
+                    drop(per_cred_permit);
+                    attempt_count += 1;
+                    continue;
+                }
+            };
+
+            // 单一加权派送策略：始终更新 current_id 为本次选中的凭证
+            *self.current_id.lock() = id;
+
+            // 5. 获取 global permit（如配置了 global_concurrency > 0）
+            //    注意锁顺序：先拿 per-cred permit，再拿 global permit；不会跟其他路径形成环
+            let global_arc_opt = { self.global_semaphore.lock().clone() };
+            let global_permit = if let Some(g) = global_arc_opt {
+                match g.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        drop(per_cred_permit);
+                        return Err(anyhow::anyhow!("global semaphore closed: {}", e));
+                    }
+                }
+            } else {
+                None
+            };
+
+            // 6. 尝试获取/刷新 Token，并把 permit 注入 CallContext（Drop 自动归还）
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
+                    ctx._credential_permit = Some(per_cred_permit);
+                    ctx._global_permit = global_permit;
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 早 drop：刷新失败时尽快归还 permit，避免占用排队席位
+                    drop(per_cred_permit);
+                    drop(global_permit);
+
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1066,56 +1245,6 @@ impl MultiTokenManager {
                 *current_id = best.id;
             }
         }
-    }
-
-    /// 选择最佳凭据（两级排序：使用次数最少 + 余额最多；完全相同则轮询）
-    ///
-    /// 对齐 BK：
-    /// - 第一优先级：`recent_usage` 最小（未初始化的视为 u32::MAX，避免被优先选中）
-    /// - 第二优先级：`remaining` 最大（NaN 归一化为 0.0）
-    /// - 完全相同时使用 `selection_rr` 轮询兜底，避免总选第一个
-    fn select_best_candidate_id(&self, candidate_ids: &[u64]) -> Option<u64> {
-        if candidate_ids.is_empty() {
-            return None;
-        }
-
-        let rr = self.selection_rr.fetch_add(1, Ordering::Relaxed) as usize;
-        let cache = self.balance_cache.lock();
-
-        let mut scored: Vec<(u64, u32, f64)> = Vec::with_capacity(candidate_ids.len());
-        for &id in candidate_ids {
-            let (usage, balance, initialized) = cache
-                .get(&id)
-                .map(|c| (c.recent_usage, c.remaining, c.initialized))
-                .unwrap_or((0, 0.0, false));
-            // 未初始化的凭据视为使用次数最大，避免被优先选中
-            let effective_usage = if initialized { usage } else { u32::MAX };
-            // NaN 余额归一化为 0.0，避免 total_cmp 将 NaN 视为最大值
-            let effective_balance = if balance.is_finite() { balance } else { 0.0 };
-            scored.push((id, effective_usage, effective_balance));
-        }
-        drop(cache);
-
-        // 第一优先级：使用次数最少
-        let min_usage = scored.iter().map(|(_, usage, _)| *usage).min()?;
-        scored.retain(|(_, usage, _)| *usage == min_usage);
-
-        // 第二优先级：余额最多（使用次数相同）
-        let mut max_balance = scored.first().map(|(_, _, b)| *b).unwrap_or(0.0);
-        for &(_, _, balance) in &scored {
-            if balance > max_balance {
-                max_balance = balance;
-            }
-        }
-        scored.retain(|(_, _, balance)| *balance == max_balance);
-
-        if scored.len() == 1 {
-            return Some(scored[0].0);
-        }
-
-        // 兜底：完全相同则轮询，避免总选第一个
-        let index = rr % scored.len();
-        Some(scored[index].0)
     }
 
     // ============================================================
@@ -1464,6 +1593,8 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _credential_permit: None,
+                _global_permit: None,
             });
         }
 
@@ -1535,6 +1666,8 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _credential_permit: None,
+            _global_permit: None,
         })
     }
 
@@ -1549,18 +1682,6 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
-        };
-
         // 收集所有凭据
         //
         // 仅持久化「手动禁用」状态：自动禁用（失败阈值 / 额度用尽 / 认证失败 /
@@ -1577,9 +1698,32 @@ impl MultiTokenManager {
                 })
                 .collect()
         };
+        self.write_credentials_snapshot(&credentials)
+    }
+
+    /// 把指定 snapshot 原子写入凭据文件。
+    ///
+    /// 与 [`persist_credentials`] 的区别是：调用方自己负责构造 snapshot
+    /// （可在 in-memory 真正落更前用临时快照试写），常用于 admin API 的
+    /// 「先 persist、再改 in-memory」语义，避免写盘失败时内存与磁盘不一致。
+    fn write_credentials_snapshot(
+        &self,
+        credentials: &[KiroCredentials],
+    ) -> anyhow::Result<bool> {
+        use anyhow::Context;
+
+        // 仅多凭据格式才回写
+        if !self.is_multiple_format {
+            return Ok(false);
+        }
+
+        let path = match &self.credentials_path {
+            Some(p) => p,
+            None => return Ok(false),
+        };
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = serde_json::to_string_pretty(credentials).context("序列化凭据失败")?;
 
         // 原子写入：先写临时文件，再 rename 替换目标文件
         // rename 在同一文件系统上是原子操作，避免进程崩溃导致凭据文件损坏
@@ -2007,6 +2151,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        // 短暂 lock sema map 拷贝 Arc（纯内存查询，不阻塞），释放后再在 map 闭包内读 available_permits
+        let sema_snapshot: std::collections::HashMap<u64, std::sync::Arc<tokio::sync::Semaphore>> =
+            self.credential_semaphores.lock().clone();
+        let max_permits = self.config.read().per_credential_concurrency;
 
         ManagerSnapshot {
             entries: entries
@@ -2067,6 +2215,12 @@ impl MultiTokenManager {
                         DisabledReason::ModelUnavailable => "ModelUnavailable",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    available_permits: sema_snapshot
+                        .get(&e.id)
+                        .map(|s| s.available_permits())
+                        .unwrap_or(0),
+                    max_permits,
+                    concurrency: e.credentials.concurrency,
                 })
                 .collect(),
             current_id,
@@ -2076,33 +2230,83 @@ impl MultiTokenManager {
     }
 
     /// 设置凭据禁用状态（Admin API）
+    ///
+    /// 语义：先把"含变更的 snapshot"原子写入凭据文件，写盘成功后再修改 in-memory。
+    /// 写盘失败 → 返回 Err，in-memory 维持原状，磁盘与内存保持一致。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = disabled;
-            if !disabled {
-                // 启用时重置失败计数
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                entry.disabled_reason = None;
-            } else {
-                entry.disabled_reason = Some(DisabledReason::Manual);
+        // 1) 锁内构造含变更的 snapshot（不修改真 entries）
+        let snapshot: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            if !entries.iter().any(|e| e.id == id) {
+                anyhow::bail!("凭据不存在: {}", id);
             }
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    // 默认沿用 in-memory 当前的「手动禁用」标记
+                    let mut is_manual_disabled = e.disabled_reason == Some(DisabledReason::Manual);
+                    if e.id == id {
+                        is_manual_disabled = disabled;
+                    }
+                    cred.disabled = is_manual_disabled;
+                    cred
+                })
+                .collect()
+        };
+
+        // 2) 先持久化（含变更）；失败直接返回，in-memory 不动
+        self.write_credentials_snapshot(&snapshot)?;
+
+        // 3) 持久化成功后，再回写 in-memory
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        entry.disabled = disabled;
+        if !disabled {
+            // 启用时重置失败计数
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.disabled_reason = None;
+        } else {
+            entry.disabled_reason = Some(DisabledReason::Manual);
         }
-        // 持久化更改
-        self.persist_credentials()?;
         Ok(())
     }
 
     /// 设置凭据优先级（Admin API）
     ///
-    /// 修改优先级后会立即按新优先级重新选择当前凭据。
-    /// 即使持久化失败，内存中的优先级和当前凭据选择也会生效。
+    /// 语义：先把"含新优先级的 snapshot"原子写入凭据文件，写盘成功后再修改
+    /// in-memory 并按新优先级重新选择当前凭据。写盘失败 → 返回 Err，
+    /// in-memory 与 current_id 维持原状。
     pub fn set_priority(&self, id: u64, priority: u32) -> anyhow::Result<()> {
+        // 1) 锁内构造含新优先级的 snapshot（不修改真 entries）
+        let snapshot: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            if !entries.iter().any(|e| e.id == id) {
+                anyhow::bail!("凭据不存在: {}", id);
+            }
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled_reason == Some(DisabledReason::Manual);
+                    if e.id == id {
+                        cred.priority = priority;
+                    }
+                    cred
+                })
+                .collect()
+        };
+
+        // 2) 先持久化；失败直接返回，in-memory 不动
+        self.write_credentials_snapshot(&snapshot)?;
+
+        // 3) 持久化成功后，再回写 in-memory
         {
             let mut entries = self.entries.lock();
             let entry = entries
@@ -2111,10 +2315,83 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.priority = priority;
         }
-        // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
+        // 4) 按新优先级重新选择当前凭据
         self.select_highest_priority();
-        // 持久化更改
-        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级最大并发数（Admin API）
+    ///
+    /// 语义：先把“含新 concurrency 的 snapshot”原子写入凭据文件，写盘成功后再修改
+    /// in-memory 与单凭据 Semaphore。写盘失败 → 返回 Err，
+    /// in-memory 与 Semaphore 维持原状。
+    ///
+    /// # 行为
+    /// - `Some(0)` 视为非法（避免凭据被永久阻塞）
+    /// - `None` 表示清除凭据级覆盖，回退到全局 `per_credential_concurrency`
+    /// - Semaphore 替换策略：直接 `replace` 整个 `Arc<Semaphore>`；
+    ///   旧 permit 在 Drop 时归还到旧 Arc（无副作用），新请求走新 Arc
+    pub fn set_credential_concurrency(
+        &self,
+        id: u64,
+        concurrency: Option<u32>,
+    ) -> anyhow::Result<()> {
+        // 0 校验：避免凭据被永久阻塞
+        if let Some(0) = concurrency {
+            anyhow::bail!("concurrency 必须 >= 1（None 表示回退到全局默认）");
+        }
+
+        // 1) 锁内构造含新 concurrency 的 snapshot（不修改真 entries）
+        let snapshot: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            if !entries.iter().any(|e| e.id == id) {
+                anyhow::bail!("凭据不存在: {}", id);
+            }
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled_reason == Some(DisabledReason::Manual);
+                    if e.id == id {
+                        cred.concurrency = concurrency;
+                    }
+                    cred
+                })
+                .collect()
+        };
+
+        // 2) 先持久化；失败直接返回，in-memory 不动
+        self.write_credentials_snapshot(&snapshot)?;
+
+        // 3) 持久化成功后，再回写 in-memory
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.concurrency = concurrency;
+        }
+
+        // 4) 重建对应单凭据 Semaphore（直接替换 Arc）
+        //    - 配额优先取凭据级 concurrency，None 时回退全局 per_credential_concurrency
+        //    - 旧 permit Drop 时归还旧 Arc，无副作用；新请求走新 Arc
+        let n = concurrency
+            .map(|v| v as usize)
+            .unwrap_or_else(|| self.config.read().per_credential_concurrency)
+            .max(1);
+        {
+            let mut map = self.credential_semaphores.lock();
+            map.insert(id, Arc::new(Semaphore::new(n)));
+        }
+
+        tracing::info!(
+            "凭据 #{} 单凭据并发数已设置为: {} (override = {:?})",
+            id,
+            n,
+            concurrency
+        );
         Ok(())
     }
 
@@ -2503,6 +2780,20 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.concurrency = new_cred.concurrency;
+
+        // 为新凭据登记并发信号量（配额优先取凭据级 concurrency，未设则回退到全局配置）
+        // 必须放在 entries.lock 之前，因为后续 push 会 move validated_cred
+        {
+            let per_cred_limit = self.config.read().per_credential_concurrency.max(1);
+            let n = validated_cred
+                .concurrency
+                .map(|v| v as usize)
+                .unwrap_or(per_cred_limit)
+                .max(1);
+            let mut sema_map = self.credential_semaphores.lock();
+            sema_map.insert(new_id, Arc::new(Semaphore::new(n)));
+        }
 
         {
             let mut entries = self.entries.lock();
@@ -2581,6 +2872,12 @@ impl MultiTokenManager {
             }
         }
 
+        // 移除被删凭据的并发信号量（entries 锁释放后再操作，避免锁顺序冲突）
+        {
+            let mut sema_map = self.credential_semaphores.lock();
+            sema_map.remove(&id);
+        }
+
         // 持久化更改
         self.persist_credentials()?;
 
@@ -2633,52 +2930,114 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 获取负载均衡模式（Admin API）
-    pub fn get_load_balancing_mode(&self) -> String {
-        self.load_balancing_mode.lock().clone()
-    }
-
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.read().config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
-                return Ok(());
-            }
-        };
-
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = mode.to_string();
-        config
-            .save()
-            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
-
-        Ok(())
-    }
-
-    /// 设置负载均衡模式（Admin API）
-    pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
+    /// 设置单凭据最大并发数（Admin API/运行时调整）
+    ///
+    /// # 行为
+    /// - n >= 1（0 无意义）；n == 旧值时 noop
+    /// - 写入 config 内存值后，对所有已注册的 per-credential `Semaphore`：
+    ///     - 增配额：`add_permits(delta)`
+    ///     - 减配额：`tokio::spawn` 异步 `acquire_many(delta).forget()`，不阻塞调用方
+    /// - m2 阶段不持久化；admin API 阶段对接持久化钩子
+    ///
+    /// # 参数
+    /// - `old`：变更前的旧值（由调用方从 with_config_mut 之前的 snapshot 读取，避免
+    ///   service 层在闭包内提前写入 cfg 后此处再读 config 读到新值导致 noop）
+    /// - `n`：变更后的新值
+    pub fn set_per_credential_concurrency(&self, old: usize, n: usize) -> anyhow::Result<()> {
+        if n == 0 {
+            anyhow::bail!("per_credential_concurrency 必须 >= 1");
         }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        let old = old.max(1);
+        if old == n {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        // 注：config 持久化由调用方（admin service.update_global_config）在 with_config_mut
+        // 闭包内统一完成；此处仅做运行时 Semaphore 配额调整，避免双写竞态。
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
-            return Err(err);
+        // 收集所有 Arc<Semaphore> 后释放锁，避免长时间持锁
+        let semas: Vec<Arc<Semaphore>> = {
+            let map = self.credential_semaphores.lock();
+            map.values().cloned().collect()
+        };
+
+        if n > old {
+            let delta = n - old;
+            for sema in semas {
+                sema.add_permits(delta);
+            }
+        } else {
+            let delta = (old - n) as u32;
+            for sema in semas {
+                tokio::spawn(async move {
+                    if let Ok(permits) = sema.acquire_many(delta).await {
+                        permits.forget();
+                    }
+                });
+            }
         }
 
-        tracing::info!("负载均衡模式已设置为: {}", mode);
+        tracing::info!("单凭据最大并发数已设置为: {} (旧值 {})", n, old);
+        Ok(())
+    }
+
+    /// 设置全局最大并发数（Admin API/运行时调整）
+    ///
+    /// # 行为
+    /// - 0 表示不限；n == 旧值时 noop
+    /// - 0 ↔ N 切换：直接替换 `Option<Arc<Semaphore>>`；
+    ///   注意此时已 hold 的 permit 归还到旧 Arc（旧 Arc Drop 时无副作用），
+    ///   可能造成新 Arc 短暂"虚空"配额——非致命，但应避免在高并发下频繁 0↔N 切换
+    /// - N1 → N2 (都 > 0)：在原 Arc 上 `add_permits` 或 `acquire_many+forget`
+    /// - m2 阶段不持久化
+    ///
+    /// # 参数
+    /// - `old`：变更前的旧值（由调用方在 with_config_mut 之前从 snapshot 读取，避免双写竞态）
+    /// - `n`：变更后的新值（0 表示不限制全局并发）
+    pub fn set_global_concurrency(&self, old: usize, n: usize) -> anyhow::Result<()> {
+        if old == n {
+            return Ok(());
+        }
+
+        // 注：config 持久化由调用方（admin service.update_global_config）在 with_config_mut
+        // 闭包内统一完成；此处仅做运行时 global_semaphore 切换，避免双写竞态。
+
+        let mut slot = self.global_semaphore.lock();
+        match (old, n) {
+            (0, _) => {
+                // 0 → N：新建 Arc 替换（旧持有者归还到 None / 旧 Arc，无副作用）
+                *slot = if n > 0 {
+                    Some(Arc::new(Semaphore::new(n)))
+                } else {
+                    None
+                };
+            }
+            (_, 0) => {
+                // N → 0：直接置 None；旧 permit holders Drop 时归还到旧 Arc，无副作用
+                *slot = None;
+            }
+            _ => {
+                // N1 → N2 (都 > 0)：在原 Arc 上调整配额
+                if let Some(sema) = slot.as_ref().cloned() {
+                    if n > old {
+                        sema.add_permits(n - old);
+                    } else {
+                        let delta = (old - n) as u32;
+                        tokio::spawn(async move {
+                            if let Ok(permits) = sema.acquire_many(delta).await {
+                                permits.forget();
+                            }
+                        });
+                    }
+                } else {
+                    // 理论不可达：old > 0 但 slot is None；兜底新建
+                    *slot = Some(Arc::new(Semaphore::new(n)));
+                }
+            }
+        }
+
+        tracing::info!("全局最大并发数已设置为: {} (旧值 {})", n, old);
         Ok(())
     }
 
@@ -3150,35 +3509,6 @@ mod tests {
         assert_ne!(manager.snapshot().current_id, initial_id);
     }
 
-    #[test]
-    fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
-
-        let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        manager
-            .set_load_balancing_mode("balanced".to_string())
-            .unwrap();
-
-        let persisted = Config::load(&config_path).unwrap();
-        assert_eq!(persisted.load_balancing_mode, "balanced");
-        assert_eq!(manager.get_load_balancing_mode(), "balanced");
-
-        std::fs::remove_file(&config_path).unwrap();
-    }
-
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -3210,8 +3540,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
+        let config = Config::default();
 
         let mut bad_cred = KiroCredentials::default();
         bad_cred.priority = 0;
@@ -3470,5 +3799,331 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ============================================================
+    // 凭据并发控制测试 — 单凭据 Semaphore + FIFO 排队 + 动态扩缩
+    // ============================================================
+    mod concurrency_tests {
+        use super::super::*;
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+        use tokio::time::timeout as tokio_timeout;
+
+        /// 构造一个"看起来有效"的凭据：未过期、含 access_token、含 refresh_token
+        /// 这样 acquire_context 不会触发刷新逻辑，能快速走完 try_ensure_token
+        fn make_cred(tag: &str) -> KiroCredentials {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("refresh-{}-{}", tag, "x".repeat(120)));
+            c.access_token = Some(format!("token-{}", tag));
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c
+        }
+
+        fn make_config(per_cred: usize, timeout_secs: u64) -> Config {
+            let mut config = Config::default();
+            config.per_credential_concurrency = per_cred;
+            config.acquire_wait_timeout_secs = timeout_secs;
+            config
+        }
+
+        /// 测试 1：候选 A 被占满时，选位逻辑自动跳到 B 立即拿到（不阻塞）
+        #[tokio::test]
+        async fn test_skip_busy_credential() {
+            let config = make_config(1, 5);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("a"), make_cred("b")],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+            // 占用任意一个凭据
+            let ctx1 = manager.acquire_context(None).await.unwrap();
+
+            // 立即再来一个：应该跳过满的、命中空的，无需等待
+            let ctx2 = tokio_timeout(
+                StdDuration::from_millis(500),
+                manager.acquire_context(None),
+            )
+            .await
+            .expect("满凭据应被跳过，另一凭据应立即可拿")
+            .unwrap();
+
+            assert_ne!(
+                ctx1.id, ctx2.id,
+                "两个 ctx 必须分属不同凭据（skip_busy 失败）"
+            );
+        }
+
+        /// 测试 2：所有凭据满时，acquire 会 await 直到 permit 释放
+        #[tokio::test]
+        async fn test_wait_when_full_then_acquire() {
+            let config = make_config(1, 10);
+            let manager = Arc::new(
+                MultiTokenManager::new(config, vec![make_cred("only")], None, None, false)
+                    .unwrap(),
+            );
+
+            let ctx1 = manager.acquire_context(None).await.unwrap();
+            let id1 = ctx1.id;
+
+            // 后台等待者：因唯一凭据满会进 wait_any_credential
+            let manager_clone = Arc::clone(&manager);
+            let waiter =
+                tokio::spawn(async move { manager_clone.acquire_context(None).await });
+
+            // 给 waiter 一段时间确认它确实在等
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+            assert!(
+                !waiter.is_finished(),
+                "全满情况下 acquire 应该阻塞，而不是直接返回"
+            );
+
+            // 释放第一个 permit，waiter 应被唤醒
+            drop(ctx1);
+
+            let ctx2 = tokio_timeout(StdDuration::from_secs(2), waiter)
+                .await
+                .expect("permit 释放后 waiter 应及时完成")
+                .expect("waiter 任务不应 panic")
+                .expect("acquire 应成功（permit 已归还）");
+
+            assert_eq!(ctx2.id, id1, "唯一凭据，复用同一 id");
+        }
+
+        /// 测试 3：等待超时时返回 sentinel "credential queue wait timeout"
+        #[tokio::test]
+        async fn test_acquire_timeout_returns_sentinel() {
+            // 1s 超时，便于快速验证
+            let config = make_config(1, 1);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("only")],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+            // 占满，且持有不释放
+            let _ctx_hold = manager.acquire_context(None).await.unwrap();
+
+            let start = std::time::Instant::now();
+            let err = manager
+                .acquire_context(None)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            let elapsed = start.elapsed();
+
+            assert!(
+                err.contains("credential queue wait timeout"),
+                "错误信息应包含 sentinel，实际: {}",
+                err
+            );
+            // 给宽松下界，避免 CI 抖动；上界不卡死，仅防 0ms 立即返回
+            assert!(
+                elapsed >= StdDuration::from_millis(500),
+                "超时应至少接近配置时长 1s，实际: {:?}",
+                elapsed
+            );
+        }
+
+        /// 测试 4：CallContext drop 后，permit 自动归还，下次 acquire 立即成功
+        #[tokio::test]
+        async fn test_drop_releases_permit() {
+            let config = make_config(1, 5);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("only")],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+            {
+                let _ctx = manager.acquire_context(None).await.unwrap();
+                // 离开作用域 → CallContext drop → permit 归还
+            }
+
+            // 下一次应立即可拿（不应等 timeout）
+            let _ctx2 = tokio_timeout(
+                StdDuration::from_millis(500),
+                manager.acquire_context(None),
+            )
+            .await
+            .expect("drop 后 permit 应已归还，acquire 应立即成功")
+            .unwrap();
+        }
+
+        /// 测试 5：等待中的 acquire future 被取消时，不泄漏 permit
+        #[tokio::test]
+        async fn test_cancel_safe_no_permit_leak() {
+            // 长 timeout，避免触发 sentinel
+            let config = make_config(1, 30);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("only")],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+            let ctx1 = manager.acquire_context(None).await.unwrap();
+
+            // 用外层 timeout 强制取消等待中的 acquire（模拟客户端断开）
+            let cancelled = tokio_timeout(
+                StdDuration::from_millis(150),
+                manager.acquire_context(None),
+            )
+            .await;
+            assert!(cancelled.is_err(), "应被外层 timeout 取消");
+
+            // 释放第一个 permit
+            drop(ctx1);
+
+            // 若取消时泄漏了"幽灵 permit"，这里会再次卡住超时
+            let _ctx2 = tokio_timeout(
+                StdDuration::from_secs(1),
+                manager.acquire_context(None),
+            )
+            .await
+            .expect("取消的 future 必须归还 permit，否则池被永久占满")
+            .unwrap();
+        }
+
+        /// 测试 6：动态扩缩容 — set_per_credential_concurrency 增加 permit
+        #[tokio::test]
+        async fn test_dynamic_resize_increase() {
+            let config = make_config(1, 2);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("only")],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+            // 当前 per_cred=1，先占满
+            let ctx1 = manager.acquire_context(None).await.unwrap();
+
+            // 在线扩到 3：底层 add_permits(2)
+            manager.set_per_credential_concurrency(1, 3).unwrap();
+
+            // 应该再拿到 2 个（新增 permit 立即可用）
+            let ctx2 = tokio_timeout(
+                StdDuration::from_millis(500),
+                manager.acquire_context(None),
+            )
+            .await
+            .expect("扩容后第 2 个 permit 应立即可拿")
+            .unwrap();
+            let ctx3 = tokio_timeout(
+                StdDuration::from_millis(500),
+                manager.acquire_context(None),
+            )
+            .await
+            .expect("扩容后第 3 个 permit 应立即可拿")
+            .unwrap();
+
+            // 第 4 个：超出新上限 3，应进入等待并被外层 timeout 取消
+            let r = tokio_timeout(
+                StdDuration::from_millis(200),
+                manager.acquire_context(None),
+            )
+            .await;
+            assert!(r.is_err(), "已达扩容后上限，第 4 个应等待");
+
+            drop(ctx1);
+            drop(ctx2);
+            drop(ctx3);
+        }
+
+        /// 测试 7：set_disabled 持久化失败时，in-memory 状态不被改动
+        ///
+        /// 通过传入一个无法写入的非法路径（/proc 下不允许写），让
+        /// write_credentials_snapshot 在 atomic_write 阶段返回 Err，
+        /// 验证 setter 不会反序——即先 persist、再改 in-memory 的语义生效。
+        #[test]
+        fn test_set_disabled_persist_fails_keeps_in_memory() {
+            // 单线程 runtime，setter 内部调 block_in_place 需要 multi_thread；
+            // 但 setter 本身是同步函数，且 persist 路径会 try_current()，
+            // 这里不在 runtime 内调用，让 persist 直接走 do_atomic_write 同步分支。
+            let config = make_config(1, 5);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("a"), make_cred("b")],
+                None,
+                Some(PathBuf::from("/proc/xkiro-nonexistent/credentials.json")),
+                true,
+            )
+            .unwrap();
+
+            let snapshot_before = manager.snapshot();
+            let target_id = snapshot_before.entries[0].id;
+            assert!(!snapshot_before.entries[0].disabled, "前置：未禁用");
+
+            // setter 应返回 Err（rename 到 /proc 不允许）
+            let r = manager.set_disabled(target_id, true);
+            assert!(r.is_err(), "持久化失败时 set_disabled 必须返回 Err");
+
+            // in-memory 应保持原状
+            let snapshot_after = manager.snapshot();
+            let entry_after = snapshot_after
+                .entries
+                .iter()
+                .find(|e| e.id == target_id)
+                .expect("目标凭据应仍存在");
+            assert!(
+                !entry_after.disabled,
+                "持久化失败后 in-memory disabled 不应被改动"
+            );
+        }
+
+        /// 测试 8：set_priority 持久化失败时，in-memory 状态与 current_id 不被改动
+        #[test]
+        fn test_set_priority_persist_fails_keeps_in_memory() {
+            let config = make_config(1, 5);
+            let manager = MultiTokenManager::new(
+                config,
+                vec![make_cred("a"), make_cred("b")],
+                None,
+                Some(PathBuf::from("/proc/xkiro-nonexistent/credentials.json")),
+                true,
+            )
+            .unwrap();
+
+            let snapshot_before = manager.snapshot();
+            let target_id = snapshot_before.entries[0].id;
+            let priority_before = snapshot_before.entries[0].priority;
+            let current_before = snapshot_before.current_id;
+
+            // setter 应返回 Err（rename 到 /proc 不允许）
+            let r = manager.set_priority(target_id, priority_before.saturating_add(5));
+            assert!(r.is_err(), "持久化失败时 set_priority 必须返回 Err");
+
+            // in-memory 优先级与 current_id 应保持原状
+            let snapshot_after = manager.snapshot();
+            let entry_after = snapshot_after
+                .entries
+                .iter()
+                .find(|e| e.id == target_id)
+                .expect("目标凭据应仍存在");
+            assert_eq!(
+                entry_after.priority, priority_before,
+                "持久化失败后 in-memory priority 不应被改动"
+            );
+            assert_eq!(
+                snapshot_after.current_id, current_before,
+                "持久化失败后 current_id 不应被改动"
+            );
+        }
     }
 }
