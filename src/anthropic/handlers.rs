@@ -22,7 +22,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, extract_session_id};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
@@ -1025,10 +1025,13 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    let user_id = payload
+    let raw_user_id = payload
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref());
+    // 提取 session_id 作为亲和 key；裸 user_id 是机器哈希常量，不能作 key
+    let session_id_owned = raw_user_id.and_then(extract_session_id);
+    let user_id = session_id_owned.as_deref();
 
     // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile（BK 模式）
     let prompt_cache = state.prompt_cache_snapshot();
@@ -1773,10 +1776,12 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    let user_id = payload
+    let raw_user_id = payload
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_deref());
+    let session_id_owned = raw_user_id.and_then(extract_session_id);
+    let user_id = session_id_owned.as_deref();
 
     if payload.stream {
         // 流式响应（缓冲模式）

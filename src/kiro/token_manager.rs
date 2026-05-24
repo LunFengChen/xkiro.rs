@@ -21,6 +21,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::common::utf8::floor_char_boundary;
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::affinity::SessionAffinity;
 use crate::kiro::background_refresh::{BackgroundRefreshConfig, BackgroundRefresher, RefreshResult};
 use crate::kiro::endpoint::{
     CLI_ENDPOINT_NAME, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
@@ -655,6 +656,8 @@ pub struct MultiTokenManager {
     credential_semaphores: Mutex<HashMap<u64, Arc<Semaphore>>>,
     /// 全局并发信号量（None 表示不限，对应 config.global_concurrency = 0）
     global_semaphore: Mutex<Option<Arc<Semaphore>>>,
+    /// Session 亲和性：让同一会话连续请求黏住同一凭据（提升上游 prompt cache 命中率）
+    session_affinity: SessionAffinity,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -844,6 +847,7 @@ impl MultiTokenManager {
             background_refresher: Mutex::new(None),
             credential_semaphores: Mutex::new(credential_semaphores),
             global_semaphore: Mutex::new(global_semaphore),
+            session_affinity: SessionAffinity::default(),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1120,18 +1124,128 @@ impl MultiTokenManager {
         }
     }
 
-    /// 已废弃的亲和路径 —— 直接走 rank 分发
+    /// 按 session_id 亲和获取调用上下文
     ///
-    /// 每条 message 请求独立 rank：(priority, in_flight, remaining_bucket)。
-    /// 不绑定 user_id，避免设备级常量 user_id（机器哈希）形成永久粘连。
-    /// user_id 仅用于上层日志/审计。
-    pub async fn acquire_context_for_user(
+    /// 同一 session（per-conversation UUID）连续请求黏住同一凭据，
+    /// 提升上游 prompt cache 命中率。**严禁**用 device-level user_id 作 key
+    /// （机器哈希常量，会让所有 session 永久粘连同一凭据破坏平摊）。
+    ///
+    /// 流程：
+    /// 1. 命中绑定且凭据 enabled / 模型匹配 / sema 抢到 → 复用，touch
+    /// 2. 命中但 sema 抢不到（in_flight 满）→ 移除绑定，回退到 rank 分流
+    ///    （避免长期黏在拥堵凭据上）
+    /// 3. 命中但凭据 disabled / 模型不允许 → 清绑定，rank 重选
+    /// 4. 未命中 / session_id 缺失 → rank 选 + 新建绑定
+    ///
+    /// 参数 `session_id`：
+    /// - `None` 或空：等同 `acquire_context`（不建立绑定）
+    /// - `Some(uuid)`：以此 UUID 为 key 走亲和路径
+    pub async fn acquire_context_for_session(
         &self,
-        _user_id: Option<&str>,
+        session_id: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context(model).await
+        let sid = match session_id {
+            Some(s) if !s.is_empty() => s,
+            _ => return self.acquire_context(model).await,
+        };
+
+        // 命中亲和绑定 → 校验后尝试复用
+        if let Some(bound_id) = self.session_affinity.get(sid) {
+            // 校验：未禁用 + 模型允许（与 rank_candidates 同源筛选）
+            let usable = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == bound_id && !e.disabled)
+                    .map(|e| Self::credential_supports_model(e, model))
+                    .unwrap_or(false)
+            };
+            if !usable {
+                tracing::debug!(
+                    session = %sid,
+                    credential_id = %bound_id,
+                    "亲和命中但凭据已禁用 / 模型不允许，重选"
+                );
+                self.session_affinity.remove(sid);
+            } else {
+                // 尝试 try_acquire 绑定凭据的 sema
+                let sema_opt = {
+                    let map = self.credential_semaphores.lock();
+                    map.get(&bound_id).cloned()
+                };
+                if let Some(sema) = sema_opt
+                    && let Ok(per_cred_permit) = sema.try_acquire_owned()
+                {
+                    let credentials = {
+                        let entries = self.entries.lock();
+                        entries
+                            .iter()
+                            .find(|e| e.id == bound_id && !e.disabled)
+                            .map(|e| e.credentials.clone())
+                    };
+                    if let Some(creds) = credentials {
+                        let global_arc_opt = { self.global_semaphore.lock().clone() };
+                        let global_permit = if let Some(g) = global_arc_opt {
+                            match g.acquire_owned().await {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    drop(per_cred_permit);
+                                    return Err(anyhow::anyhow!(
+                                        "global semaphore closed: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        match self.try_ensure_token(bound_id, &creds).await {
+                            Ok(mut ctx) => {
+                                ctx._credential_permit = Some(per_cred_permit);
+                                ctx._global_permit = global_permit;
+                                self.session_affinity.touch(sid);
+                                return Ok(ctx);
+                            }
+                            Err(e) => {
+                                drop(per_cred_permit);
+                                drop(global_permit);
+                                tracing::debug!(
+                                    session = %sid,
+                                    credential_id = %bound_id,
+                                    error = %e,
+                                    "亲和绑定凭据 token 刷新失败，回退到 rank"
+                                );
+                            }
+                        }
+                    } else {
+                        drop(per_cred_permit);
+                    }
+                } else {
+                    tracing::debug!(
+                        session = %sid,
+                        credential_id = %bound_id,
+                        "亲和绑定凭据 sema 满，本次分流（保留绑定）"
+                    );
+                }
+            }
+        }
+
+        // 未命中 / 命中失败：走 rank 分发，并在成功时记录绑定
+        let ctx = self.acquire_context(model).await?;
+        self.session_affinity.set(sid, ctx.id);
+        Ok(ctx)
     }
+
+    /// 检查凭据是否支持指定模型（与 rank_candidates 筛选规则一致）
+    fn credential_supports_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+        let Some(m) = model else { return true };
+        if !m.to_lowercase().contains("opus") {
+            return true;
+        }
+        entry.credentials.supports_opus()
+    }
+
 
     /// 获取 API 调用上下文
     ///
@@ -2130,6 +2244,7 @@ impl MultiTokenManager {
             }
             has_available
         };
+        self.session_affinity.remove_by_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -2263,6 +2378,10 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
         } else {
             entry.disabled_reason = Some(DisabledReason::Manual);
+        }
+        drop(entries);
+        if disabled {
+            self.session_affinity.remove_by_credential(id);
         }
         Ok(())
     }
@@ -2868,6 +2987,8 @@ impl MultiTokenManager {
             let mut sema_map = self.credential_semaphores.lock();
             sema_map.remove(&id);
         }
+        // 清掉绑到此凭据的所有 session 亲和
+        self.session_affinity.remove_by_credential(id);
 
         // 持久化更改
         self.persist_credentials()?;

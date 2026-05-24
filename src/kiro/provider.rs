@@ -210,7 +210,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let mut ctx = match self.token_manager.acquire_context_for_user(user_id, None).await {
+            let mut ctx = match self.token_manager.acquire_context_for_session(user_id, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -395,7 +395,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_for_user(user_id, model.as_deref())
+                .acquire_context_for_session(user_id, model.as_deref())
                 .await
             {
                 Ok(c) => c,
