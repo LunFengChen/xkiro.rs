@@ -16,6 +16,10 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
 
+    /// 超额配置 (overageConfiguration.overageStatus = ENABLED / DISABLED)
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
@@ -28,6 +32,19 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 超额资格 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE)
+    #[serde(default)]
+    pub overage_capability: Option<String>,
+}
+
+/// 超额配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 超额状态 (ENABLED / DISABLED)
+    #[serde(default)]
+    pub overage_status: Option<String>,
 }
 
 /// 使用量明细
@@ -62,6 +79,14 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 超额上限（KIRO Pro/Pro+ 才有，单位与 usage_limit 一致）
+    #[serde(default)]
+    pub overage_cap: f64,
+
+    /// 超额上限（精确值）
+    #[serde(default)]
+    pub overage_cap_with_precision: f64,
 }
 
 /// 奖励额度
@@ -139,6 +164,34 @@ impl UsageLimitsResponse {
         self.subscription_info
             .as_ref()
             .and_then(|info| info.subscription_title.as_deref())
+    }
+
+    /// 获取超额资格 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE)
+    pub fn overage_capability(&self) -> Option<&str> {
+        self.subscription_info
+            .as_ref()
+            .and_then(|info| info.overage_capability.as_deref())
+    }
+
+    /// 获取远端超额开关 (ENABLED / DISABLED)
+    pub fn overage_status(&self) -> Option<&str> {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|cfg| cfg.overage_status.as_deref())
+    }
+
+    /// 获取超额上限（精确值优先，回退整数版本）
+    ///
+    /// 仅取主 breakdown 的 overageCap 字段，不含 trial/bonus。
+    pub fn overage_cap(&self) -> f64 {
+        let Some(breakdown) = self.primary_breakdown() else {
+            return 0.0;
+        };
+        if breakdown.overage_cap_with_precision > 0.0 {
+            breakdown.overage_cap_with_precision
+        } else {
+            breakdown.overage_cap
+        }
     }
 
     /// 获取第一个使用量明细

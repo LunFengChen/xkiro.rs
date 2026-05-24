@@ -3,7 +3,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext, UsageRequestParts};
+use super::{KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts};
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
 const CLI_ORIGIN: &str = "KIRO_CLI";
@@ -190,5 +190,48 @@ impl KiroEndpoint for CliEndpoint {
         }
 
         Ok(UsageRequestParts { url, headers })
+    }
+
+    fn set_preference_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        overage_status: &str,
+    ) -> anyhow::Result<PreferenceRequestParts> {
+        let host = self.host(ctx);
+        let url = format!("https://{}/setUserPreference", host);
+
+        let mut body = serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+        });
+        // CLI 端点也允许带 profileArn（API Key 凭据无；SSO OIDC 不带）
+        let auth_method = ctx.credentials.auth_method.as_deref();
+        let is_sso_oidc = matches!(auth_method, Some("builder-id") | Some("idc"))
+            || (ctx.credentials.client_id.is_some() && ctx.credentials.client_secret.is_some());
+        if !is_sso_oidc {
+            if let Some(arn) = ctx.credentials.profile_arn.as_deref() {
+                body["profileArn"] = serde_json::Value::String(arn.to_string());
+            }
+        }
+
+        let mut headers = vec![
+            ("Accept", "application/json".to_string()),
+            ("content-type", "application/json".to_string()),
+            ("x-amz-user-agent", self.runtime_x_amz_user_agent()),
+            ("user-agent", self.runtime_user_agent()),
+            ("host", host),
+            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
+            ("amz-sdk-request", "attempt=1; max=1".to_string()),
+            ("Authorization", format!("Bearer {}", ctx.token)),
+        ];
+
+        if ctx.credentials.is_api_key_credential() {
+            headers.push(("tokentype", "API_KEY".to_string()));
+        }
+
+        Ok(PreferenceRequestParts {
+            url,
+            headers,
+            body: serde_json::to_string(&body)?,
+        })
     }
 }

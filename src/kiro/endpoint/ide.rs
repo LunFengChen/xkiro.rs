@@ -12,7 +12,7 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext, UsageRequestParts};
+use super::{KiroEndpoint, PreferenceRequestParts, RequestContext, UsageRequestParts};
 use crate::kiro::model::credentials::KiroCredentials;
 
 /// Kiro IDE 端点名称
@@ -203,6 +203,58 @@ impl KiroEndpoint for IdeEndpoint {
         }
 
         Ok(UsageRequestParts { url, headers })
+    }
+
+    fn set_preference_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        overage_status: &str,
+    ) -> anyhow::Result<PreferenceRequestParts> {
+        let host = self.host(ctx);
+        let url = format!("https://{}/setUserPreference", host);
+
+        let mut body = serde_json::json!({
+            "overageConfiguration": { "overageStatus": overage_status },
+        });
+        if let Some(profile_arn) = Self::mcp_profile_arn_header_value(ctx.credentials) {
+            body["profileArn"] = serde_json::Value::String(profile_arn.to_string());
+        }
+
+        let mut headers = vec![
+            ("content-type", "application/json".to_string()),
+            (
+                "x-amz-user-agent",
+                format!(
+                    "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+                    ctx.config.kiro_version, ctx.machine_id
+                ),
+            ),
+            (
+                "user-agent",
+                format!(
+                    "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+                    ctx.config.system_version,
+                    ctx.config.node_version,
+                    ctx.config.kiro_version,
+                    ctx.machine_id
+                ),
+            ),
+            ("host", host),
+            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
+            ("amz-sdk-request", "attempt=1; max=1".to_string()),
+            ("Authorization", format!("Bearer {}", ctx.token)),
+            ("Connection", "close".to_string()),
+        ];
+
+        if ctx.credentials.is_api_key_credential() {
+            headers.push(("tokentype", "API_KEY".to_string()));
+        }
+
+        Ok(PreferenceRequestParts {
+            url,
+            headers,
+            body: serde_json::to_string(&body)?,
+        })
     }
 }
 

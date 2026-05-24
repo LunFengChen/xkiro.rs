@@ -26,6 +26,16 @@ pub struct UsageRequestParts {
     pub headers: Vec<(&'static str, String)>,
 }
 
+/// `setUserPreference` 请求所需的 URL + headers + 请求体
+///
+/// 用于切换上游 overage 开关。不同端点的 host / user-agent 沿用各自的 usage
+/// 风格。请求体由 endpoint 拼装，profileArn 处理与 usage 一致。
+pub struct PreferenceRequestParts {
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: String,
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
@@ -63,6 +73,16 @@ pub trait KiroEndpoint: Send + Sync {
     /// 不同端点的查询参数和 user-agent 不同，由 provider 拿到 [`UsageRequestParts`]
     /// 后组装 reqwest 请求并发送。
     fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts>;
+
+    /// 构造 `setUserPreference` 请求所需的 URL + headers + body
+    ///
+    /// 用于切换 overage 开关；body 形如 `{"overageConfiguration":{"overageStatus":"ENABLED|DISABLED"},"profileArn":"..."}`，
+    /// SSO OIDC 凭据需省略 profileArn。
+    fn set_preference_request_parts(
+        &self,
+        ctx: &RequestContext<'_>,
+        overage_status: &str,
+    ) -> anyhow::Result<PreferenceRequestParts>;
 
     /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
     fn is_monthly_request_limit(&self, body: &str) -> bool {

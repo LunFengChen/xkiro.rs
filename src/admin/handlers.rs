@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, BatchRefreshRequest, ImportTokenJsonRequest, SetConcurrencyRequest,
-        SetDisabledRequest, SetEndpointRequest, SetPriorityRequest, SetRegionRequest,
-        SuccessResponse, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+        SetDisabledRequest, SetEndpointRequest, SetOverageRequest, SetPriorityRequest,
+        SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -268,5 +268,25 @@ pub async fn force_refresh_balances_batch(
     Json(req): Json<BatchRefreshRequest>,
 ) -> impl IntoResponse {
     Json(state.service.force_refresh_balances_batch(req.ids).await).into_response()
+}
+
+/// POST /api/admin/credentials/:id/overage
+/// 切换上游 overage 开关（调用 Kiro setUserPreference）
+pub async fn set_credential_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetOverageRequest>,
+) -> impl IntoResponse {
+    match state.service.set_overage_status(id, payload.enabled).await {
+        Ok(_) => {
+            let action = if payload.enabled { "已开启" } else { "已关闭" };
+            Json(SuccessResponse::new(format!(
+                "凭据 #{} 超额开关{}",
+                id, action
+            )))
+            .into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 

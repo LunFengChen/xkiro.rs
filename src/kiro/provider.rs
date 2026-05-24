@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -20,15 +21,27 @@ use crate::model::config::TlsBackend;
 use parking_lot::{Mutex, RwLock};
 
 /// API 调用结果
+///
+/// `_credential_permit` / `_global_permit` 持有到上游响应消费完成（一次"上游来回"）：
+/// - 流式：handler 在 SSE unfold 中读到上游 `body_stream` 返回 `None`/`Err` 即立即 drop。
+/// - 非流式：`response.bytes().await` 完成即随 ApiCallResult 一起 drop。
+///
+/// 不绑客户端消费速度，避免慢客户端把凭据并发位长期占住。
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub _credential_permit: Option<OwnedSemaphorePermit>,
+    pub _global_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// MCP 调用结果
+///
+/// permit 语义同 [`ApiCallResult`]：随上游响应消费完成立即释放。
 pub struct McpCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub _credential_permit: Option<OwnedSemaphorePermit>,
+    pub _global_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// 每个凭据的最大重试次数
@@ -197,7 +210,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context_for_user(user_id, None).await {
+            let mut ctx = match self.token_manager.acquire_context_for_user(user_id, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -261,6 +274,8 @@ impl KiroProvider {
                 return Ok(McpCallResult {
                     response,
                     credential_id: ctx.id,
+                    _credential_permit: ctx._credential_permit.take(),
+                    _global_permit: ctx._global_permit.take(),
                 });
             }
 
@@ -378,7 +393,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self
+            let mut ctx = match self
                 .token_manager
                 .acquire_context_for_user(user_id, model.as_deref())
                 .await
@@ -449,6 +464,8 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    _credential_permit: ctx._credential_permit.take(),
+                    _global_permit: ctx._global_permit.take(),
                 });
             }
 

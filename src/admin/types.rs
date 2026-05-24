@@ -12,8 +12,6 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
-    /// 当前活跃凭据 ID
-    pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -30,8 +28,6 @@ pub struct CredentialStatusItem {
     pub disabled: bool,
     /// 连续失败次数
     pub failure_count: u32,
-    /// 是否为当前活跃凭据
-    pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
     pub expires_at: Option<String>,
     /// 认证方式
@@ -95,6 +91,14 @@ pub struct SetPriorityRequest {
 pub struct SetConcurrencyRequest {
     /// 凭据级最大并发（>=1，None=回退全局 per_credential_concurrency）
     pub concurrency: Option<u32>,
+}
+
+/// 切换上游 overage 开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOverageRequest {
+    /// 是否开启远端超额（true=ENABLED / false=DISABLED）
+    pub enabled: bool,
 }
 
 /// 修改 region 请求
@@ -213,6 +217,15 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 超额上限（订阅可超额时 > 0）
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// 超额资格 (OVERAGE_CAPABLE / OVERAGE_INCAPABLE / null)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_capability: Option<String>,
+    /// 远端超额开关 (ENABLED / DISABLED / null)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_status: Option<String>,
 }
 
 /// 缓存余额信息
@@ -221,14 +234,27 @@ pub struct BalanceResponse {
 pub struct CachedBalanceItem {
     /// 凭据 ID
     pub id: u64,
-    /// 缓存的剩余额度
-    pub remaining: f64,
-    /// 使用限额
+    /// 当前使用量
+    pub current_usage: f64,
+    /// 使用限额（base + trial + bonus 聚合）
     pub usage_limit: f64,
+    /// 剩余额度
+    pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
     /// 订阅类型
     pub subscription_title: Option<String>,
+    /// 下次重置时间（Unix 时间戳）
+    pub next_reset_at: Option<f64>,
+    /// 超额上限
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// 超额资格
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_capability: Option<String>,
+    /// 远端超额开关
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_status: Option<String>,
     /// 缓存时间（Unix 毫秒时间戳）
     pub cached_at: u64,
     /// 缓存存活时间（秒），缓存过期时间 = cached_at + ttl_secs * 1000

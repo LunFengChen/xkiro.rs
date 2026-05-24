@@ -12,7 +12,8 @@ use super::{
         get_compression_config, get_credential_balance, get_global_config, get_proxy_config,
         get_runtime_stats, import_token_json, reset_failure_count, set_compression_config,
         set_credential_concurrency, set_credential_disabled, set_credential_endpoint,
-        set_credential_priority, set_credential_region, update_global_config, update_proxy_config,
+        set_credential_overage, set_credential_priority, set_credential_region,
+        update_global_config, update_proxy_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -65,6 +66,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/region", post(set_credential_region))
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
+        .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/runtime-stats", get(get_runtime_stats))
         .route(
             "/credentials/refresh-batch",

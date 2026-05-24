@@ -13,7 +13,7 @@ use crate::common::utf8::floor_char_boundary;
 use crate::http_client::ProxyConfig;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{LOW_BALANCE_THRESHOLD, MultiTokenManager};
 use crate::model::config::CompressionConfig;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -91,6 +91,143 @@ impl AdminService {
         }
     }
 
+    /// 启动后并行预取所有未禁用凭据的余额，写入 disk-cache
+    ///
+    /// - 不复用运行时 `balance_semaphore`(cap 8)；启动期无其它流量，
+    ///   用独立 `Semaphore(32)` 拉高启动并发，所有未禁用凭据近似同时发出
+    /// - 已被磁盘缓存命中且未过期的凭据跳过，避免每次启动都打上游
+    /// - 单条失败逐条降级，仅日志告警，不阻塞启动
+    pub async fn prefetch_balances_on_startup(self: Arc<Self>) {
+        let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp() as f64;
+
+        let stale_ids: Vec<u64> = {
+            let cache = self.balance_cache.lock();
+            snapshot
+                .entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .filter_map(|e| {
+                    let fresh = cache
+                        .get(&e.id)
+                        .map(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
+                        .unwrap_or(false);
+                    if fresh { None } else { Some(e.id) }
+                })
+                .collect()
+        };
+
+        if stale_ids.is_empty() {
+            tracing::info!("启动余额预取：磁盘缓存命中所有凭据，跳过");
+            return;
+        }
+
+        let total = stale_ids.len();
+        // 启动专用并发上限 32：兼顾打满网络与避免对上游过度突发
+        let startup_sem = Arc::new(Semaphore::new(32));
+        let mut tasks: JoinSet<(u64, Option<BalanceResponse>, Option<String>)> = JoinSet::new();
+
+        tracing::info!(
+            "启动余额预取：{} 个凭据并行获取（cap=32）",
+            total
+        );
+
+        for id in stale_ids {
+            let token_manager = self.token_manager.clone();
+            let sem = startup_sem.clone();
+            tasks.spawn(async move {
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(e) => return (id, None, Some(format!("acquire startup semaphore: {e}"))),
+                };
+                match token_manager.get_usage_limits_for(id).await {
+                    Ok(usage) => {
+                        let current_usage = usage.current_usage();
+                        let usage_limit = usage.usage_limit();
+                        let remaining = (usage_limit - current_usage).max(0.0);
+                        let usage_percentage = if usage_limit > 0.0 {
+                            (current_usage / usage_limit * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        let resp = BalanceResponse {
+                            id,
+                            subscription_title: usage.subscription_title().map(|s| s.to_string()),
+                            current_usage,
+                            usage_limit,
+                            remaining,
+                            usage_percentage,
+                            next_reset_at: usage.next_date_reset,
+                            overage_cap: usage.overage_cap(),
+                            overage_capability: usage.overage_capability().map(|s| s.to_string()),
+                            overage_status: usage.overage_status().map(|s| s.to_string()),
+                        };
+                        (id, Some(resp), None)
+                    }
+                    Err(e) => (id, None, Some(e.to_string())),
+                }
+            });
+        }
+
+        let mut success = 0usize;
+        let mut failed = 0usize;
+        let mut low_balance_disabled = 0usize;
+        let cache_now = Utc::now().timestamp() as f64;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((id, Some(balance), _)) => {
+                    let remaining = balance.remaining;
+                    {
+                        let mut cache = self.balance_cache.lock();
+                        cache.insert(
+                            id,
+                            CachedBalance {
+                                cached_at: cache_now,
+                                data: balance,
+                            },
+                        );
+                    }
+                    // 同步运行时余额缓存（路由决策用），合并掉 token_manager.initialize_balances 的工作
+                    self.token_manager.update_balance_cache(id, remaining);
+                    if remaining < LOW_BALANCE_THRESHOLD {
+                        self.token_manager.mark_insufficient_balance(id);
+                        low_balance_disabled += 1;
+                        tracing::warn!(
+                            "凭据 #{} 余额不足 ({:.2})，已自动禁用",
+                            id,
+                            remaining
+                        );
+                    } else {
+                        tracing::info!("凭据 #{} 余额初始化成功: {:.2}", id, remaining);
+                    }
+                    success += 1;
+                }
+                Ok((id, None, err)) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "启动余额预取失败 #{}: {}",
+                        id,
+                        err.unwrap_or_else(|| "unknown".to_string())
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("启动余额预取 task join 失败: {}", e);
+                }
+            }
+        }
+        // 一次性持久化，避免每条都写盘
+        self.save_balance_cache();
+
+        tracing::info!(
+            "启动余额预取完成：成功 {}，失败 {}，低余额禁用 {}（共 {}）",
+            success,
+            failed,
+            low_balance_disabled,
+            total
+        );
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
@@ -104,7 +241,6 @@ impl AdminService {
                 priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
@@ -131,25 +267,15 @@ impl AdminService {
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
-            current_id: snapshot.current_id,
             credentials,
         }
     }
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
-
         self.token_manager
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
-
-        // 只有禁用的是当前凭据时才尝试切换到下一个
-        if disabled && id == current_id {
-            let _ = self.token_manager.switch_to_next();
-        }
         Ok(())
     }
 
@@ -263,6 +389,9 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            overage_cap: usage.overage_cap(),
+            overage_capability: usage.overage_capability().map(|s| s.to_string()),
+            overage_status: usage.overage_status().map(|s| s.to_string()),
         })
     }
 
@@ -281,34 +410,76 @@ impl AdminService {
             .map(|info| (info.id, info))
             .collect();
 
-        // 从 AdminService 磁盘缓存获取完整余额信息
-        let disk_cache = self.balance_cache.lock();
+        // 以 entries 为基准遍历，磁盘缓存提供完整数据，运行时缓存提供 cached_at/ttl
+        // 任一来源命中即返回该凭据的余额条目
+        let snapshot_ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .collect();
 
-        let balances = runtime_balances
+        let disk_cache = self.balance_cache.lock();
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let balances = snapshot_ids
             .into_iter()
-            .map(|(id, info)| {
-                // 优先从磁盘缓存获取完整快照（保证字段一致性）
-                if let Some(cached) = disk_cache.get(&id) {
+            .filter_map(|id| {
+                let runtime = runtime_balances.get(&id);
+                let disk = disk_cache.get(&id);
+                if runtime.is_none() && disk.is_none() {
+                    return None;
+                }
+
+                // cached_at 优先用 runtime，其次用 disk 自带时间戳
+                let (cached_at, ttl_secs) = match runtime {
+                    Some(r) => (r.cached_at, r.ttl_secs),
+                    None => {
+                        let disk_at_ms = disk
+                            .map(|d| (d.cached_at * 1000.0) as u64)
+                            .unwrap_or(now_unix_ms);
+                        // 启动后磁盘命中但 runtime 缺失：用 BALANCE_CACHE_TTL_SECS 兜底
+                        (disk_at_ms, BALANCE_CACHE_TTL_SECS as u64)
+                    }
+                };
+
+                let item = if let Some(cached) = disk {
                     CachedBalanceItem {
                         id,
-                        remaining: cached.data.remaining,
+                        current_usage: cached.data.current_usage,
                         usage_limit: cached.data.usage_limit,
+                        remaining: cached.data.remaining,
                         usage_percentage: cached.data.usage_percentage,
                         subscription_title: cached.data.subscription_title.clone(),
-                        cached_at: info.cached_at,
-                        ttl_secs: info.ttl_secs,
+                        next_reset_at: cached.data.next_reset_at,
+                        overage_cap: cached.data.overage_cap,
+                        overage_capability: cached.data.overage_capability.clone(),
+                        overage_status: cached.data.overage_status.clone(),
+                        cached_at,
+                        ttl_secs,
                     }
                 } else {
+                    let r = runtime.unwrap();
                     CachedBalanceItem {
                         id,
-                        remaining: info.remaining,
+                        current_usage: 0.0,
                         usage_limit: 0.0,
+                        remaining: r.remaining,
                         usage_percentage: 0.0,
                         subscription_title: None,
-                        cached_at: info.cached_at,
-                        ttl_secs: info.ttl_secs,
+                        next_reset_at: None,
+                        overage_cap: 0.0,
+                        overage_capability: None,
+                        overage_status: None,
+                        cached_at,
+                        ttl_secs,
                     }
-                }
+                };
+                Some(item)
             })
             .collect();
 
@@ -402,6 +573,33 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 切换上游 overage 开关（调用 Kiro `setUserPreference`）
+    ///
+    /// 上游会自行校验资格（INCAPABLE 订阅会返回 4xx）。这里直接透传上游错误，
+    /// 不在 admin 侧做资格预检——避免和余额缓存 TTL/未刷新的状态产生不一致。
+    pub async fn set_overage_status(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_overage_status_for(id, enabled)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+
+        // 清磁盘缓存：避免后续 get_balance 走 TTL 命中老值
+        let removed = {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id).is_some()
+        };
+        if removed {
+            self.save_balance_cache();
+        }
+        // 清 token_manager 运行时缓存（同样目的）
+        self.token_manager.invalidate_balance_cache(id);
+        Ok(())
     }
 
     /// 轻量运行时状态快照（高频轮询用，纯内存读取，不触发任何 IO）
@@ -587,6 +785,11 @@ impl AdminService {
                                 remaining,
                                 usage_percentage,
                                 next_reset_at: usage.next_date_reset,
+                                overage_cap: usage.overage_cap(),
+                                overage_capability: usage
+                                    .overage_capability()
+                                    .map(|s| s.to_string()),
+                                overage_status: usage.overage_status().map(|s| s.to_string()),
                             }),
                             error: None,
                         }
@@ -636,6 +839,25 @@ impl AdminService {
         }
         // 按 id 升序便于前端展示
         results.sort_by_key(|r| r.id);
+
+        // 批量成功项写回磁盘缓存（与单条 force-refresh 余额端点一致），
+        // 让启动后预取与 GET /balances/cached 始终能读到最新快照
+        let now_ts = Utc::now().timestamp() as f64;
+        {
+            let mut cache = self.balance_cache.lock();
+            for item in &results {
+                if let (true, Some(balance)) = (item.success, item.balance.as_ref()) {
+                    cache.insert(
+                        item.id,
+                        CachedBalance {
+                            cached_at: now_ts,
+                            data: balance.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        self.save_balance_cache();
 
         BatchRefreshBalanceResponse {
             results,

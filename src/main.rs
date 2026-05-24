@@ -152,12 +152,8 @@ async fn main() {
         token_manager.start_background_refresh(BackgroundRefreshConfig::default());
     tracing::info!("后台 Token 刷新任务已启动");
 
-    // 初始化所有凭据的余额缓存（顺序查询，间隔 0.5s 避免限流）
-    // 余额 < 1.0 的凭据会自动禁用并标记 InsufficientBalance
-    let init_count = token_manager.initialize_balances().await;
-    if init_count == 0 && token_manager.total_count() > 0 {
-        tracing::warn!("所有凭据余额初始化失败，将按优先级选择凭据");
-    }
+    // 余额初始化由 AdminService::prefetch_balances_on_startup 统一负责：
+    // 一次上游 getUsageLimits → 同时回填磁盘缓存（dashboard）+ 运行时缓存（路由决策）+ 低余额禁用
 
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
@@ -218,6 +214,14 @@ async fn main() {
                 endpoint_names.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
+
+            // 启动时后台并行预取所有未禁用凭据余额，写入 disk-cache
+            // 让前端首次访问 dashboard 时就能从 /balances/cached 直接拿到完整快照
+            {
+                let svc = admin_state.service.clone();
+                tokio::spawn(async move { svc.prefetch_balances_on_startup().await });
+            }
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
