@@ -124,12 +124,12 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-3xl w-[90vw] h-[75vh] max-h-[75vh] p-0 gap-0 flex flex-col">
+      <DialogContent className="sm:max-w-3xl p-0 gap-0">
         <DialogHeader className="px-6 pt-5 pb-4 border-b shrink-0">
           <DialogTitle>设置</DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-1 overflow-hidden">
+        <div className="flex flex-1 min-h-0 overflow-hidden">
           {/* 左侧导航 */}
           <nav className="w-40 shrink-0 border-r bg-muted/30 py-2 overflow-y-auto">
             {TABS.map(tab => (
@@ -149,7 +149,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           </nav>
 
           {/* 右侧内容 */}
-          <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
             <div className="flex-1 overflow-y-auto px-6 py-4">
               {loading ? (
                 <div className="flex items-center justify-center h-full">
