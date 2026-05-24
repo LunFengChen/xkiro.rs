@@ -702,15 +702,34 @@ impl KiroProvider {
         tokio::spawn(async move {
             match tm.get_usage_limits_for(id).await {
                 Ok(resp) => {
-                    let remaining = resp.usage_limit() - resp.current_usage();
-                    tm.update_balance_cache(id, remaining);
-                    tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
-                    if remaining < 1.0 {
+                    let usage_limit = resp.usage_limit();
+                    let current_usage = resp.current_usage();
+                    let remaining = (usage_limit - current_usage).max(0.0);
+                    // 真正不可用 = 正式额度耗尽 AND（超额未开启 OR 超额额度耗尽）
+                    let overage_enabled = resp.overage_status() == Some("ENABLED");
+                    let overage_used = (current_usage - usage_limit).max(0.0);
+                    let overage_remaining = if overage_enabled {
+                        (resp.overage_cap() - overage_used).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    tm.update_balance_cache_full(id, remaining, overage_remaining);
+                    let exhausted = remaining < 1.0 && overage_remaining < 1.0;
+                    tracing::debug!(
+                        "凭据 #{} 余额缓存已刷新: 正式 {:.2}, 超额 enabled={} remaining={:.2}",
+                        id,
+                        remaining,
+                        overage_enabled,
+                        overage_remaining
+                    );
+                    if exhausted {
                         tm.mark_insufficient_balance(id);
                         tracing::warn!(
-                            "凭据 #{} 余额不足 ({:.2})，已主动禁用",
+                            "凭据 #{} 额度耗尽（正式 {:.2}, 超额 enabled={} remaining={:.2}），已主动禁用",
                             id,
-                            remaining
+                            remaining,
+                            overage_enabled,
+                            overage_remaining
                         );
                     }
                 }

@@ -15,7 +15,7 @@ interface BalanceDialogProps {
 }
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const { data: balance, isLoading, error } = useCredentialBalance(credentialId, true)
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'

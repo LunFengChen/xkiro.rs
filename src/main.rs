@@ -221,6 +221,12 @@ async fn main() {
                 let svc = admin_state.service.clone();
                 tokio::spawn(async move { svc.prefetch_balances_on_startup().await });
             }
+            // 启动周期性余额刷新：每 600s 拉一次所有未禁用凭据余额/订阅/超额
+            // 同步两层缓存（admin disk + token_manager 运行时），低余额自动禁用
+            admin_state
+                .service
+                .clone()
+                .start_periodic_balance_refresh(300);
 
             let admin_app = admin::create_admin_router(admin_state);
 

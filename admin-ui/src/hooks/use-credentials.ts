@@ -22,11 +22,11 @@ export function useCredentials() {
   })
 }
 
-// 查询凭据余额
-export function useCredentialBalance(id: number | null) {
+// 查询凭据余额；force=true 跳过后端缓存
+export function useCredentialBalance(id: number | null, force = false) {
   return useQuery({
-    queryKey: ['credential-balance', id],
-    queryFn: () => getCredentialBalance(id!),
+    queryKey: ['credential-balance', id, force],
+    queryFn: () => getCredentialBalance(id!, force),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
   })

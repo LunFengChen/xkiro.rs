@@ -86,9 +86,13 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+// 获取凭据余额；force=true 跳过后端缓存，强制走云端
+export async function getCredentialBalance(
+  id: number,
+  force = false,
+): Promise<BalanceResponse> {
+  const url = force ? `/credentials/${id}/balance?force=1` : `/credentials/${id}/balance`
+  const { data } = await api.get<BalanceResponse>(url)
   return data
 }
 

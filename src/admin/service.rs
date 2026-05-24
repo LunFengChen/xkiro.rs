@@ -33,6 +33,23 @@ use crate::kiro::token_manager::CachedBalanceInfo;
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
+#[derive(Default)]
+struct RefreshBalanceStats {
+    success: usize,
+    failed: usize,
+    low_balance_disabled: usize,
+}
+
+/// 计算超额额度剩余：仅当 overage_status=ENABLED 时 > 0
+fn overage_remaining(balance: &BalanceResponse) -> f64 {
+    if balance.overage_status.as_deref() == Some("ENABLED") {
+        let used = (balance.current_usage - balance.usage_limit).max(0.0);
+        (balance.overage_cap - used).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -123,22 +140,82 @@ impl AdminService {
         }
 
         let total = stale_ids.len();
-        // 启动专用并发上限 32：兼顾打满网络与避免对上游过度突发
-        let startup_sem = Arc::new(Semaphore::new(32));
-        let mut tasks: JoinSet<(u64, Option<BalanceResponse>, Option<String>)> = JoinSet::new();
+        tracing::info!("启动余额预取：{} 个凭据并行获取（cap=32）", total);
+        let stats = self.refresh_balances_concurrent(stale_ids, 32).await;
 
         tracing::info!(
-            "启动余额预取：{} 个凭据并行获取（cap=32）",
+            "启动余额预取完成：成功 {}，失败 {}，低余额禁用 {}（共 {}）",
+            stats.success,
+            stats.failed,
+            stats.low_balance_disabled,
             total
         );
+    }
 
-        for id in stale_ids {
+    /// 启动周期性余额刷新任务
+    ///
+    /// 每 `interval_secs` 触发一次，并发拉取所有未禁用凭据的最新余额/订阅/超额信息，
+    /// 写回 admin disk-cache + token_manager 运行时缓存。低余额自动禁用。
+    /// 与启动预取共享 `refresh_balances_concurrent`，复用上游限流。
+    pub fn start_periodic_balance_refresh(self: Arc<Self>, interval_secs: u64) {
+        if interval_secs == 0 {
+            tracing::warn!("interval_secs=0，余额定时刷新未启动");
+            return;
+        }
+        tokio::spawn(async move {
+            tracing::info!(
+                "余额定时刷新已启动: 间隔 {}s, 并发 cap=8",
+                interval_secs
+            );
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // 跳过首 tick（启动预取已处理过一次）
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let snapshot = self.token_manager.snapshot();
+                let active_ids: Vec<u64> = snapshot
+                    .entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .map(|e| e.id)
+                    .collect();
+                if active_ids.is_empty() {
+                    tracing::debug!("余额定时刷新：无活跃凭据");
+                    continue;
+                }
+                let total = active_ids.len();
+                let stats = self.refresh_balances_concurrent(active_ids, 8).await;
+                tracing::info!(
+                    "余额定时刷新完成：成功 {}，失败 {}，低余额禁用 {}（共 {}）",
+                    stats.success,
+                    stats.failed,
+                    stats.low_balance_disabled,
+                    total
+                );
+            }
+        });
+    }
+
+    /// 并发刷新指定凭据列表的余额
+    ///
+    /// - 用 `Semaphore(concurrency)` 限并发；每个成功项写回两层 cache 并同步运行时调度器
+    /// - 余额低于 `LOW_BALANCE_THRESHOLD` 自动禁用
+    /// - 完成后一次性 `save_balance_cache`
+    async fn refresh_balances_concurrent(
+        self: &Arc<Self>,
+        ids: Vec<u64>,
+        concurrency: usize,
+    ) -> RefreshBalanceStats {
+        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+        let mut tasks: JoinSet<(u64, Option<BalanceResponse>, Option<String>)> = JoinSet::new();
+
+        for id in ids {
             let token_manager = self.token_manager.clone();
-            let sem = startup_sem.clone();
+            let sem = sem.clone();
             tasks.spawn(async move {
                 let _permit = match sem.acquire().await {
                     Ok(p) => p,
-                    Err(e) => return (id, None, Some(format!("acquire startup semaphore: {e}"))),
+                    Err(e) => return (id, None, Some(format!("acquire semaphore: {e}"))),
                 };
                 match token_manager.get_usage_limits_for(id).await {
                     Ok(usage) => {
@@ -169,14 +246,13 @@ impl AdminService {
             });
         }
 
-        let mut success = 0usize;
-        let mut failed = 0usize;
-        let mut low_balance_disabled = 0usize;
+        let mut stats = RefreshBalanceStats::default();
         let cache_now = Utc::now().timestamp() as f64;
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok((id, Some(balance), _)) => {
                     let remaining = balance.remaining;
+                    let overage_rem = overage_remaining(&balance);
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -187,46 +263,48 @@ impl AdminService {
                             },
                         );
                     }
-                    // 同步运行时余额缓存（路由决策用），合并掉 token_manager.initialize_balances 的工作
-                    self.token_manager.update_balance_cache(id, remaining);
-                    if remaining < LOW_BALANCE_THRESHOLD {
+                    self.token_manager
+                        .update_balance_cache_full(id, remaining, overage_rem);
+                    // 真正不可用 = 正式额度耗尽 AND（超额未开启 OR 超额额度耗尽）
+                    let exhausted = remaining < LOW_BALANCE_THRESHOLD
+                        && overage_rem < LOW_BALANCE_THRESHOLD;
+                    if exhausted {
                         self.token_manager.mark_insufficient_balance(id);
-                        low_balance_disabled += 1;
+                        stats.low_balance_disabled += 1;
                         tracing::warn!(
-                            "凭据 #{} 余额不足 ({:.2})，已自动禁用",
+                            "凭据 #{} 额度耗尽（正式 {:.2}, 超额 remaining={:.2}），已自动禁用",
                             id,
-                            remaining
+                            remaining,
+                            overage_rem
                         );
                     } else {
-                        tracing::info!("凭据 #{} 余额初始化成功: {:.2}", id, remaining);
+                        tracing::debug!(
+                            "凭据 #{} 余额已刷新: 正式 {:.2}, 超额 remaining={:.2}",
+                            id,
+                            remaining,
+                            overage_rem
+                        );
                     }
-                    success += 1;
+                    stats.success += 1;
                 }
                 Ok((id, None, err)) => {
-                    failed += 1;
+                    stats.failed += 1;
                     tracing::warn!(
-                        "启动余额预取失败 #{}: {}",
+                        "余额刷新失败 #{}: {}",
                         id,
                         err.unwrap_or_else(|| "unknown".to_string())
                     );
                 }
                 Err(e) => {
-                    failed += 1;
-                    tracing::warn!("启动余额预取 task join 失败: {}", e);
+                    stats.failed += 1;
+                    tracing::warn!("余额刷新 task join 失败: {}", e);
                 }
             }
         }
-        // 一次性持久化，避免每条都写盘
         self.save_balance_cache();
-
-        tracing::info!(
-            "启动余额预取完成：成功 {}，失败 {}，低余额禁用 {}（共 {}）",
-            success,
-            failed,
-            low_balance_disabled,
-            total
-        );
+        stats
     }
+
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
@@ -305,9 +383,13 @@ impl AdminService {
     }
 
     /// 获取凭据余额（带缓存）
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
+    pub async fn get_balance(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        // force=true 跳过缓存，直接走云端
+        if !force {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
@@ -321,7 +403,7 @@ impl AdminService {
         // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
 
-        // 更新缓存
+        // 更新 admin 端展示缓存
         {
             let mut cache = self.balance_cache.lock();
             cache.insert(
@@ -333,6 +415,13 @@ impl AdminService {
             );
         }
         self.save_balance_cache();
+
+        // 同步调度器运行时余额缓存（rank_candidates 派送依据）
+        self.token_manager.update_balance_cache_full(
+            id,
+            balance.remaining,
+            overage_remaining(&balance),
+        );
 
         Ok(balance)
     }
@@ -589,7 +678,7 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        // 清磁盘缓存：避免后续 get_balance 走 TTL 命中老值
+        // 1) 清磁盘缓存：避免后续 get_balance 走 TTL 命中老值
         let removed = {
             let mut cache = self.balance_cache.lock();
             cache.remove(&id).is_some()
@@ -597,8 +686,36 @@ impl AdminService {
         if removed {
             self.save_balance_cache();
         }
-        // 清 token_manager 运行时缓存（同样目的）
+        // 2) 清 token_manager 运行时缓存（标记 initialized=false）
         self.token_manager.invalidate_balance_cache(id);
+
+        // 3) 主动拉新值回填两个 cache：overage 开关会改 cap / overage_status，
+        //    调度器和前端都需要尽快看到最新值，不能等下一次 get_balance 触发
+        match self.fetch_balance(id).await {
+            Ok(balance) => {
+                {
+                    let mut cache = self.balance_cache.lock();
+                    cache.insert(
+                        id,
+                        CachedBalance {
+                            cached_at: Utc::now().timestamp() as f64,
+                            data: balance.clone(),
+                        },
+                    );
+                }
+                self.save_balance_cache();
+                self.token_manager.update_balance_cache_full(
+                    id,
+                    balance.remaining,
+                    overage_remaining(&balance),
+                );
+            }
+            Err(e) => {
+                // 拉新失败不阻塞 overage 切换成功的语义；下一轮 should_refresh_balance 会兜底
+                tracing::warn!("overage 切换后拉新余额失败 #{}: {}", id, e);
+            }
+        }
+
         Ok(())
     }
 
@@ -858,6 +975,14 @@ impl AdminService {
             }
         }
         self.save_balance_cache();
+
+        // 同步调度器运行时余额缓存（rank_candidates 派送依据）
+        for item in &results {
+            if let (true, Some(balance)) = (item.success, item.balance.as_ref()) {
+                self.token_manager
+                    .update_balance_cache_full(item.id, balance.remaining, overage_remaining(balance));
+            }
+        }
 
         BatchRefreshBalanceResponse {
             results,

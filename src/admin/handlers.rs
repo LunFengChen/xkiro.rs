@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -97,13 +97,18 @@ pub async fn reset_failure_count(
     }
 }
 
-/// GET /api/admin/credentials/:id/balance
-/// 获取指定凭据的余额
+/// GET /api/admin/credentials/:id/balance?force=1
+/// 获取指定凭据的余额；force=1 跳过缓存强制走云端
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    let force = params
+        .get("force")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    match state.service.get_balance(id, force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
