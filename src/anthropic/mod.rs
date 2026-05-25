@@ -28,6 +28,7 @@ pub mod compressor;
 mod handlers;
 pub mod middleware;
 pub mod prompt_filter;
+pub mod prompt_presets;
 mod router;
 mod stream;
 pub mod tool_compression;

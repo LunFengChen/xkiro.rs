@@ -17,6 +17,37 @@ impl Default for TlsBackend {
     }
 }
 
+/// 自定义系统提示词注入位置
+///
+/// - `Prepend`：插入到 system 数组最前（旧默认行为）
+/// - `Append`：追加到 system 数组末尾（recency bias 权重最高，推荐用于 override）
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemPromptPosition {
+    Prepend,
+    Append,
+}
+
+impl Default for SystemPromptPosition {
+    fn default() -> Self {
+        Self::Append
+    }
+}
+
+/// 用户自定义预设（与内置 `PRESETS` 并列，可在 Admin UI 中增删改）
+///
+/// id 必须全局唯一（含内置 id），仅允许 `[a-z0-9_-]`，长度 1-32。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPreset {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
+
 /// 压缩配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +165,10 @@ pub struct PromptFilterConfig {
     /// 跳过 `# Environment` / `# auto memory` section 与单行噪音
     #[serde(default)]
     pub filter_env_noise: bool,
+    /// 剥离 Claude Code 客户端注入的安全/沙箱限制段（content_safety、git_safety、
+    /// safety_guardrails、executing_actions 等）。默认 false（opt-in）。
+    #[serde(default)]
+    pub filter_strip_restrictions: bool,
     /// 自定义过滤规则
     #[serde(default)]
     pub rules: Vec<PromptFilterRule>,
@@ -251,6 +286,30 @@ pub struct Config {
     /// 系统提示清洗配置（默认全关，向后兼容）
     #[serde(default)]
     pub prompt_filter: PromptFilterConfig,
+
+    /// 系统提示注入：自由文本补充内容（None 表示无）
+    ///
+    /// 与 `enabled_presets` / `user_presets` 拼接后由 `system_prompt_position` 指定位置注入
+    /// 到 system role。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+
+    /// 系统提示注入总开关（默认 false：关闭注入）
+    #[serde(default)]
+    pub system_prompt_enabled: bool,
+
+    /// 启用的预设 id 列表（混合内置 + 用户自定义）
+    #[serde(default)]
+    pub enabled_presets: Vec<String>,
+
+    /// 用户自定义预设清单（与内置 `PRESETS` 并列）
+    #[serde(default)]
+    pub user_presets: Vec<UserPreset>,
+
+    /// 系统提示拼接结果在 system role 中的插入位置（默认 Append）
+    #[serde(default)]
+    pub system_prompt_position: SystemPromptPosition,
 
     /// Prompt Cache TTL（秒），默认 300 秒
     #[serde(default = "default_prompt_cache_ttl_seconds")]
@@ -409,6 +468,11 @@ impl Default for Config {
             endpoints: HashMap::new(),
             compression: CompressionConfig::default(),
             prompt_filter: PromptFilterConfig::default(),
+            system_prompt: None,
+            system_prompt_enabled: false,
+            enabled_presets: Vec::new(),
+            user_presets: Vec::new(),
+            system_prompt_position: SystemPromptPosition::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),
             per_credential_concurrency: default_per_credential_concurrency(),

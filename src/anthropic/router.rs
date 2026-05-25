@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompressionConfig, PromptFilterConfig};
+use crate::model::runtime::SharedPromptConfig;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -45,11 +46,13 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     compression: Arc<RwLock<CompressionConfig>>,
     prompt_filter: Arc<RwLock<PromptFilterConfig>>,
+    prompt_runtime: SharedPromptConfig,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking, prompt_cache_runtime)
         .with_compression_config(compression)
-        .with_prompt_filter_config(prompt_filter);
+        .with_prompt_filter_config(prompt_filter)
+        .with_prompt_runtime(prompt_runtime);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

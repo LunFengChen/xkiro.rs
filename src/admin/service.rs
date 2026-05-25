@@ -14,7 +14,8 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{LOW_BALANCE_THRESHOLD, MultiTokenManager};
-use crate::model::config::CompressionConfig;
+use crate::model::config::{CompressionConfig, SystemPromptPosition, UserPreset};
+use crate::model::runtime::SharedPromptConfig;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -24,9 +25,11 @@ use super::types::{
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
     CredentialsStatusResponse, GlobalConfigResponse, ImportAction, ImportItemResult,
-    ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, ProxyConfigResponse,
-    RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse, TokenJsonItem,
-    UpdateCompressionConfigRequest, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+    ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, PresetItem,
+    ProxyConfigResponse, RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse,
+    SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
+    UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
+    UpsertUserPresetRequest,
 };
 use crate::kiro::token_manager::CachedBalanceInfo;
 
@@ -70,6 +73,8 @@ pub struct AdminService {
     compression_config: Arc<RwLock<CompressionConfig>>,
     /// Prompt Cache 运行时（共享引用，支持 ttl/accounting 热更新）
     prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+    /// 系统提示注入运行时（共享引用，支持热更新）
+    prompt_runtime: SharedPromptConfig,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -88,6 +93,7 @@ impl AdminService {
         kiro_provider: Option<Arc<KiroProvider>>,
         compression_config: Arc<RwLock<CompressionConfig>>,
         prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+        prompt_runtime: SharedPromptConfig,
         known_endpoints: impl IntoIterator<Item = String>,
     ) -> Self {
         let cache_path = token_manager
@@ -101,6 +107,7 @@ impl AdminService {
             kiro_provider,
             compression_config,
             prompt_cache_runtime,
+            prompt_runtime,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -1499,6 +1506,226 @@ impl AdminService {
         }
 
         Ok(self.get_global_config())
+    }
+
+    // ============ 系统提示注入 ============
+
+    /// 取系统提示注入快照（含 builtin + user preset 列表 + 启用状态）
+    pub fn get_system_prompt(&self) -> SystemPromptResponse {
+        let rt = self.prompt_runtime.read();
+        let mut presets: Vec<PresetItem> = Vec::new();
+
+        for p in crate::anthropic::prompt_presets::PRESETS {
+            let enabled = rt.enabled_presets.iter().any(|id| id == p.id);
+            presets.push(PresetItem {
+                id: p.id.to_string(),
+                name: p.name.to_string(),
+                description: p.description.to_string(),
+                source: "builtin".to_string(),
+                enabled,
+                content: None,
+            });
+        }
+        for up in &rt.user_presets {
+            let enabled = rt.enabled_presets.iter().any(|id| id == &up.id);
+            presets.push(PresetItem {
+                id: up.id.clone(),
+                name: up.name.clone(),
+                description: up.description.clone(),
+                source: "user".to_string(),
+                enabled,
+                content: Some(up.content.clone()),
+            });
+        }
+
+        SystemPromptResponse {
+            enabled: rt.enabled,
+            position: match rt.position {
+                SystemPromptPosition::Prepend => "prepend".to_string(),
+                SystemPromptPosition::Append => "append".to_string(),
+            },
+            custom_content: rt.custom_content.clone(),
+            presets,
+        }
+    }
+
+    /// 更新系统提示注入配置（部分字段更新；持久化到 config.json）
+    pub fn update_system_prompt(
+        &self,
+        req: UpdateSystemPromptRequest,
+    ) -> Result<SystemPromptResponse, AdminServiceError> {
+        let position = if let Some(pos) = req.position.as_deref() {
+            match pos {
+                "prepend" => Some(SystemPromptPosition::Prepend),
+                "append" => Some(SystemPromptPosition::Append),
+                _ => {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "position 仅允许 'prepend' 或 'append'".to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref ids) = req.enabled_presets {
+            let user_ids: Vec<String> = self
+                .prompt_runtime
+                .read()
+                .user_presets
+                .iter()
+                .map(|p| p.id.clone())
+                .collect();
+            for id in ids {
+                let known = crate::anthropic::prompt_presets::is_builtin(id)
+                    || user_ids.iter().any(|u| u == id);
+                if !known {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "未知 preset id: {}",
+                        id
+                    )));
+                }
+            }
+        }
+
+        self.token_manager
+            .with_config_mut(|cfg| {
+                if let Some(v) = req.enabled {
+                    cfg.system_prompt_enabled = v;
+                }
+                if let Some(p) = position {
+                    cfg.system_prompt_position = p;
+                }
+                if let Some(c) = req.custom_content.clone() {
+                    let trimmed = c.trim();
+                    cfg.system_prompt = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(c)
+                    };
+                }
+                if let Some(ids) = req.enabled_presets.clone() {
+                    cfg.enabled_presets = ids;
+                }
+                cfg.save()
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+            })?;
+
+        // 持久化成功 → 同步运行时
+        {
+            let mut rt = self.prompt_runtime.write();
+            if let Some(v) = req.enabled {
+                rt.enabled = v;
+            }
+            if let Some(p) = position {
+                rt.position = p;
+            }
+            if let Some(c) = req.custom_content {
+                let trimmed = c.trim();
+                rt.custom_content = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                };
+            }
+            if let Some(ids) = req.enabled_presets {
+                rt.enabled_presets = ids;
+            }
+        }
+
+        Ok(self.get_system_prompt())
+    }
+
+    /// 新增/覆盖用户预设（id 已存在则覆盖）；不允许与内置 id 冲突
+    pub fn upsert_user_preset(
+        &self,
+        req: UpsertUserPresetRequest,
+    ) -> Result<SystemPromptResponse, AdminServiceError> {
+        let id = req.id.trim().to_string();
+        if id.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "preset id 不能为空".to_string(),
+            ));
+        }
+        if id.len() > 32
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "preset id 仅允许 [a-z0-9_-]，长度 1-32".to_string(),
+            ));
+        }
+        if crate::anthropic::prompt_presets::is_builtin(&id) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "id '{}' 与内置预设冲突",
+                id
+            )));
+        }
+
+        let preset = UserPreset {
+            id: id.clone(),
+            name: req.name,
+            description: req.description,
+            content: req.content,
+        };
+
+        self.token_manager.with_config_mut(|cfg| {
+            if let Some(existing) = cfg.user_presets.iter_mut().find(|p| p.id == id) {
+                *existing = preset.clone();
+            } else {
+                cfg.user_presets.push(preset.clone());
+            }
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        {
+            let mut rt = self.prompt_runtime.write();
+            if let Some(existing) = rt.user_presets.iter_mut().find(|p| p.id == id) {
+                *existing = preset;
+            } else {
+                rt.user_presets.push(preset);
+            }
+        }
+
+        Ok(self.get_system_prompt())
+    }
+
+    /// 删除用户预设；同时从 enabled_presets 移除
+    pub fn delete_user_preset(
+        &self,
+        id: &str,
+    ) -> Result<SystemPromptResponse, AdminServiceError> {
+        let id_owned = id.to_string();
+
+        let existed = self
+            .prompt_runtime
+            .read()
+            .user_presets
+            .iter()
+            .any(|p| p.id == id_owned);
+        if !existed {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未找到用户预设 id: {}",
+                id_owned
+            )));
+        }
+
+        self.token_manager.with_config_mut(|cfg| {
+            cfg.user_presets.retain(|p| p.id != id_owned);
+            cfg.enabled_presets.retain(|x| x != &id_owned);
+            cfg.save()
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))
+        })?;
+
+        {
+            let mut rt = self.prompt_runtime.write();
+            rt.user_presets.retain(|p| p.id != id_owned);
+            rt.enabled_presets.retain(|x| x != &id_owned);
+        }
+
+        Ok(self.get_system_prompt())
     }
 
     /// 将更新请求中的压缩字段应用到目标 CompressionConfig

@@ -201,3 +201,37 @@ export async function getCachedBalances(): Promise<import('../types/api').Cached
   )
   return data
 }
+
+// ============ 系统提示注入 ============
+
+import type {
+  SystemPromptResponse,
+  UpdateSystemPromptRequest,
+  UpsertUserPresetRequest,
+} from '@/types/api'
+
+export async function getSystemPrompt(): Promise<SystemPromptResponse> {
+  const { data } = await api.get<SystemPromptResponse>('/config/system-prompt')
+  return data
+}
+
+export async function updateSystemPrompt(
+  req: UpdateSystemPromptRequest,
+): Promise<SystemPromptResponse> {
+  const { data } = await api.put<SystemPromptResponse>('/config/system-prompt', req)
+  return data
+}
+
+export async function upsertUserPreset(
+  req: UpsertUserPresetRequest,
+): Promise<SystemPromptResponse> {
+  const { data } = await api.post<SystemPromptResponse>('/config/user-presets', req)
+  return data
+}
+
+export async function deleteUserPreset(id: string): Promise<SystemPromptResponse> {
+  const { data } = await api.delete<SystemPromptResponse>(
+    `/config/user-presets/${encodeURIComponent(id)}`,
+  )
+  return data
+}

@@ -12,6 +12,7 @@ use super::{
         AddCredentialRequest, BatchRefreshRequest, ImportTokenJsonRequest, SetConcurrencyRequest,
         SetDisabledRequest, SetEndpointRequest, SetOverageRequest, SetPriorityRequest,
         SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest, UpdateProxyConfigRequest,
+        UpdateSystemPromptRequest, UpsertUserPresetRequest,
     },
 };
 use crate::model::config::CompressionConfig;
@@ -295,3 +296,40 @@ pub async fn set_credential_overage(
     }
 }
 
+/// GET /api/admin/config/system-prompt
+pub async fn get_system_prompt(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_system_prompt())
+}
+
+/// PUT /api/admin/config/system-prompt
+pub async fn update_system_prompt(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateSystemPromptRequest>,
+) -> impl IntoResponse {
+    match state.service.update_system_prompt(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/config/user-presets
+pub async fn upsert_user_preset(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpsertUserPresetRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_user_preset(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/config/user-presets/:id
+pub async fn delete_user_preset(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_user_preset(&id) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}

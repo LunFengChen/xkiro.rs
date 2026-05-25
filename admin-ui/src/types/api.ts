@@ -258,3 +258,47 @@ export interface CachedBalanceItem {
 export interface CachedBalancesResponse {
   balances: CachedBalanceItem[]
 }
+
+// ============ 系统提示注入 ============
+
+/** Preset 来源 */
+export type PresetSource = 'builtin' | 'user'
+
+/** 系统提示注入位置 */
+export type SystemPromptPosition = 'prepend' | 'append'
+
+/** 单条 preset（builtin 不含 content；user 含完整 content） */
+export interface PresetItem {
+  id: string
+  name: string
+  description: string
+  source: PresetSource
+  enabled: boolean
+  content?: string
+}
+
+/** GET /config/system-prompt 响应 */
+export interface SystemPromptResponse {
+  enabled: boolean
+  position: SystemPromptPosition
+  customContent: string | null
+  presets: PresetItem[]
+}
+
+/** PUT /config/system-prompt 请求（所有字段可选） */
+export interface UpdateSystemPromptRequest {
+  enabled?: boolean
+  position?: SystemPromptPosition
+  /** "" 表示清空；省略表示不变；非空表示覆盖 */
+  customContent?: string
+  /** 全量替换启用列表 */
+  enabledPresets?: string[]
+}
+
+/** POST /config/user-presets 请求 */
+export interface UpsertUserPresetRequest {
+  id: string
+  name: string
+  description?: string
+  content: string
+}

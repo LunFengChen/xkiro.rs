@@ -179,6 +179,9 @@ async fn main() {
     // 共享系统提示清洗配置（admin API 可运行时修改）
     let prompt_filter_config = Arc::new(RwLock::new(config.prompt_filter.clone()));
 
+    // 共享系统提示注入运行时配置（admin API 可运行时修改）
+    let prompt_runtime = crate::model::runtime::shared_from_config(&config);
+
     // Prompt Cache 运行时（共享引用，支持热更新）
     let prompt_cache_runtime = Arc::new(RwLock::new(
         anthropic::middleware::PromptCacheRuntime::new(
@@ -195,6 +198,7 @@ async fn main() {
         config.extract_thinking,
         compression_config.clone(),
         prompt_filter_config.clone(),
+        prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
     );
 
@@ -216,6 +220,7 @@ async fn main() {
                 Some(kiro_provider.clone()),
                 compression_config.clone(),
                 prompt_cache_runtime.clone(),
+                prompt_runtime.clone(),
                 endpoint_names.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());

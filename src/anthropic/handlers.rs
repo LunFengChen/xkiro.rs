@@ -27,9 +27,11 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    OutputConfig, SystemMessage, Thinking,
 };
 use super::websearch;
+use crate::model::config::SystemPromptPosition;
+use crate::model::runtime::SharedPromptConfig;
 
 /// 自适应压缩：最大迭代次数（避免极端输入导致过长 CPU 消耗）
 const ADAPTIVE_COMPRESSION_MAX_ITERS: usize = 32;
@@ -889,6 +891,9 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    // 注入用户配置的系统提示（preset + 自定义）
+    inject_system_prompt(&mut payload, &state.prompt_runtime);
+
     // 检查是否为 WebSearch 请求
     if websearch::should_handle_websearch_request(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -1564,21 +1569,83 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 注入运行时配置的系统提示
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 拼接 `enabled_presets` 内启用的内置 + 用户预设和 `custom_content`，
+/// 按 `position` 插入或追加到 `payload.system`。`enabled=false` 或拼接结果空时直接 no-op。
+fn inject_system_prompt(payload: &mut MessagesRequest, shared: &SharedPromptConfig) {
+    let (injection, position) = {
+        let cfg = shared.read();
+        (cfg.build_injection_text(), cfg.position)
+    };
+
+    let Some(text) = injection else {
+        return;
+    };
+    let injected = SystemMessage {
+        text,
+        block_type: None,
+        cache_control: None,
+    };
+
+    match &mut payload.system {
+        Some(existing) => match position {
+            SystemPromptPosition::Prepend => existing.insert(0, injected),
+            SystemPromptPosition::Append => existing.push(injected),
+        },
+        None => {
+            payload.system = Some(vec![injected]);
+        }
+    }
+}
+
+/// 模型名/请求兜底，确保 thinking 配置与上游兼容
+///
+/// 1. **Opus 4.7 不支持 `type: "enabled"`**：自动降级为 `adaptive`，
+///    补 `display=summarized` + `output_config.effort=high`，
+///    不论是否带 thinking 后缀。
+/// 2. **`*-thinking` 后缀**：强制开启 thinking
+///    - Opus 4.6/4.7 → `adaptive`（带 `effort: high`、`display: summarized`）
+///    - 其他模型 → `enabled`，budget_tokens=20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    let is_opus = model_lower.contains("opus");
+    let is_opus_4_7 = is_opus && (model_lower.contains("4-7") || model_lower.contains("4.7"));
+    let is_opus_4_6 = is_opus && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6_or_newer = is_opus_4_6 || is_opus_4_7;
+    let has_thinking_suffix = model_lower.contains("thinking");
+
+    // Case 1: Opus 4.7 不支持 enabled，自动降级 adaptive；不论有无后缀
+    if is_opus_4_7 {
+        if let Some(ref mut t) = payload.thinking {
+            if t.thinking_type == "enabled" {
+                tracing::info!(
+                    model = %payload.model,
+                    "Opus 4.7 不支持 thinking.type=\"enabled\"，自动降级为 \"adaptive\""
+                );
+                t.thinking_type = "adaptive".to_string();
+            }
+            if t.display.is_none() {
+                t.display = Some("summarized".to_string());
+            }
+            if payload.output_config.is_none() {
+                payload.output_config = Some(OutputConfig {
+                    effort: "high".to_string(),
+                });
+            }
+        }
+    }
+
+    // Case 2: 模型名带 *-thinking 后缀 → 强制开启
+    if !has_thinking_suffix {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_opus_4_6_or_newer {
+        "adaptive"
+    } else {
+        "enabled"
+    };
 
     tracing::info!(
         model = %payload.model,
@@ -1589,9 +1656,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
+        display: if thinking_type == "adaptive" {
+            Some("summarized".to_string())
+        } else {
+            None
+        },
     });
 
-    if is_opus_4_6 {
+    if is_opus_4_6_or_newer {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -1657,6 +1729,9 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    // 注入用户配置的系统提示（preset + 自定义）
+    inject_system_prompt(&mut payload, &state.prompt_runtime);
 
     // 检查是否为 WebSearch 请求
     if websearch::should_handle_websearch_request(&payload) {
@@ -2370,5 +2445,92 @@ mod tests {
             anyhow::anyhow!("credential queue wait timeout"),
         );
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn make_req(model: &str, thinking: Option<Thinking>, output_config: Option<OutputConfig>) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking,
+            output_config,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_enabled_downgrades_to_adaptive() {
+        let mut req = make_req(
+            "claude-opus-4-7",
+            Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20000,
+                display: None,
+            }),
+            None,
+        );
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.display.as_deref(), Some("summarized"));
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_no_thinking_does_nothing() {
+        let mut req = make_req("claude-opus-4-7", None, None);
+        override_thinking_from_model_name(&mut req);
+        assert!(req.thinking.is_none());
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_thinking_suffix_forces_adaptive() {
+        let mut req = make_req("claude-opus-4-7-thinking", None, None);
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.budget_tokens, 20000);
+        assert_eq!(t.display.as_deref(), Some("summarized"));
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_6_thinking_suffix_keeps_adaptive() {
+        let mut req = make_req("claude-opus-4-6-thinking", None, None);
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.display.as_deref(), Some("summarized"));
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn test_override_thinking_sonnet_thinking_suffix_uses_enabled() {
+        let mut req = make_req("claude-sonnet-4-5-thinking", None, None);
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "enabled");
+        assert_eq!(t.display, None);
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn test_override_thinking_opus_4_7_existing_display_preserved() {
+        let mut req = make_req(
+            "claude-opus-4-7",
+            Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+                display: Some("omitted".to_string()),
+            }),
+            None,
+        );
+        override_thinking_from_model_name(&mut req);
+        assert_eq!(req.thinking.unwrap().display.as_deref(), Some("omitted"));
     }
 }

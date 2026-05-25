@@ -197,7 +197,7 @@ You are an autonomous coding agent. Follow these principles:\n\
 /// 1. xkiro 自己上一轮注入物（避免反复堆叠）：
 ///    - [`SYSTEM_CHUNKED_POLICY`] / [`KIRO_AGENTIC_SYSTEM_PROMPT`] 整段
 ///    - `<thinking_mode>...</thinking_mode>` / `<max_thinking_length>N</max_thinking_length>`
-///      / `<thinking_effort>level</thinking_effort>`
+///      / `<thinking_effort>level</thinking_effort>` / `<thinking_display>level</thinking_display>`
 /// 2. 客户端常见噪音（参考 KAM `clean_system_prompt`）：
 ///    - `--- SYSTEM PROMPT ---` 边界
 ///    - Claude Code 后端提示 5 行（避免 layer-1 反复替换后堆叠）
@@ -209,6 +209,7 @@ fn clean_system_prompt(text: &str) -> String {
     static THINKING_MODE_RE: OnceLock<Regex> = OnceLock::new();
     static THINKING_LENGTH_RE: OnceLock<Regex> = OnceLock::new();
     static THINKING_EFFORT_RE: OnceLock<Regex> = OnceLock::new();
+    static THINKING_DISPLAY_RE: OnceLock<Regex> = OnceLock::new();
     static EXECUTION_DISCIPLINE_RE: OnceLock<Regex> = OnceLock::new();
     static CONTEXT_TIME_RE: OnceLock<Regex> = OnceLock::new();
     static CHUNKED_WRITE_RE: OnceLock<Regex> = OnceLock::new();
@@ -231,9 +232,12 @@ fn clean_system_prompt(text: &str) -> String {
         .get_or_init(|| Regex::new(r"<max_thinking_length>\d+</max_thinking_length>").unwrap());
     let thinking_effort = THINKING_EFFORT_RE
         .get_or_init(|| Regex::new(r"<thinking_effort>[^<]*</thinking_effort>").unwrap());
+    let thinking_display = THINKING_DISPLAY_RE
+        .get_or_init(|| Regex::new(r"<thinking_display>[^<]*</thinking_display>").unwrap());
     result = thinking_mode.replace_all(&result, "").into_owned();
     result = thinking_length.replace_all(&result, "").into_owned();
     result = thinking_effort.replace_all(&result, "").into_owned();
+    result = thinking_display.replace_all(&result, "").into_owned();
 
     // 客户端可能自带的 Claude Code 后端提示 5 行（避免 layer-1 反复堆叠）
     for line in [
@@ -1253,26 +1257,44 @@ fn convert_tools(
 }
 
 /// 生成thinking标签前缀
+///
+/// Opus 4.7 特殊性：
+/// - 不支持 `type: "enabled"` —— handlers 已自动降级为 `adaptive`
+/// - 默认 `display: "omitted"` —— 不主动吐 thinking 文本，需显式声明 `summarized`
+/// - instruction-following 严，加 `IMPORTANT` 兜底确保始终用 `<thinking>` 标签
 fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
+    let t = req.thinking.as_ref()?;
+    let model_lower = req.model.to_lowercase();
+    let is_opus_4_7 = model_lower.contains("opus")
+        && (model_lower.contains("4-7") || model_lower.contains("4.7"));
+
+    match t.thinking_type.as_str() {
+        "enabled" => Some(format!(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+            t.budget_tokens
+        )),
+        "adaptive" => {
             let effort = req
                 .output_config
                 .as_ref()
                 .map(|c| c.effort.as_str())
                 .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
+            let display = t.effective_display();
+            let base = format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort><thinking_display>{}</thinking_display>",
+                effort, display
+            );
+            if is_opus_4_7 && display == "summarized" {
+                Some(format!(
+                    "{}\nIMPORTANT: Wrap your full reasoning inside <thinking>...</thinking> tags BEFORE the final answer. This wrapping is required even when adaptive thinking decides the task is simple — always emit at least a brief <thinking>...</thinking> block.",
+                    base
+                ))
+            } else {
+                Some(base)
+            }
         }
+        _ => None,
     }
-    None
 }
 
 /// 检查内容是否已包含thinking标签
@@ -2072,6 +2094,121 @@ mod tests {
     fn test_context_window_opus_4_7() {
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_enabled() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(crate::anthropic::types::Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 12345,
+                display: None,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(prefix.contains("<max_thinking_length>12345</max_thinking_length>"));
+        assert!(!prefix.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_adaptive_4_7_summarized_appends_important() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(crate::anthropic::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+                display: Some("summarized".to_string()),
+            }),
+            output_config: Some(crate::anthropic::types::OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(prefix.contains("<thinking_effort>high</thinking_effort>"));
+        assert!(prefix.contains("<thinking_display>summarized</thinking_display>"));
+        assert!(prefix.contains("IMPORTANT: Wrap your full reasoning"));
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_adaptive_4_7_omitted_no_important() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(crate::anthropic::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+                display: Some("omitted".to_string()),
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_display>omitted</thinking_display>"));
+        assert!(!prefix.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_adaptive_4_6_no_important() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(crate::anthropic::types::Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+                display: None,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(prefix.contains("<thinking_display>summarized</thinking_display>"));
+        assert!(!prefix.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn test_generate_thinking_prefix_none_when_thinking_absent() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        assert!(generate_thinking_prefix(&req).is_none());
     }
 
     #[test]

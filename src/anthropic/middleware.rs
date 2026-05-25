@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompressionConfig, PromptFilterConfig};
+use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -80,6 +81,8 @@ pub struct AppState {
     pub compression_config: Arc<RwLock<CompressionConfig>>,
     /// 共享系统提示清洗配置（运行时可修改）
     pub prompt_filter_config: Arc<RwLock<PromptFilterConfig>>,
+    /// 共享系统提示注入运行时配置（运行时可修改）
+    pub prompt_runtime: SharedPromptConfig,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
 }
@@ -98,6 +101,13 @@ impl AppState {
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
             prompt_filter_config: Arc::new(RwLock::new(PromptFilterConfig::default())),
+            prompt_runtime: Arc::new(RwLock::new(PromptRuntimeConfig {
+                enabled: false,
+                enabled_presets: Vec::new(),
+                user_presets: Vec::new(),
+                custom_content: None,
+                position: crate::model::config::SystemPromptPosition::default(),
+            })),
             prompt_cache_runtime,
         }
     }
@@ -124,6 +134,12 @@ impl AppState {
     /// 设置系统提示清洗配置（接受共享引用）
     pub fn with_prompt_filter_config(mut self, config: Arc<RwLock<PromptFilterConfig>>) -> Self {
         self.prompt_filter_config = config;
+        self
+    }
+
+    /// 设置系统提示注入运行时配置（接受共享引用）
+    pub fn with_prompt_runtime(mut self, runtime: SharedPromptConfig) -> Self {
+        self.prompt_runtime = runtime;
         self
     }
 
