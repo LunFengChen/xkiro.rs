@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version label for artifacts (e.g., 2025.12.1)'
+        description: 'Version label for artifacts (e.g., 2026.5.26)'
         required: true
-        default: '2026.1.1'
+        default: '2026.5.26'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pre-check:
@@ -125,9 +125,52 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
+          name: xkiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
           compression-level: 6
           path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+            target/${{ matrix.target }}/release/xkiro-rs
+            target/${{ matrix.target }}/release/xkiro-rs.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package per-platform archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          cd artifacts
+          for d in xkiro-rs-${VERSION}-*; do
+            [ -d "$d" ] || continue
+            NAME="$d"
+            if compgen -G "$d/xkiro-rs.exe" > /dev/null; then
+              (cd "$d" && zip -9 -r "../../dist/${NAME}.zip" .)
+            else
+              chmod +x "$d/xkiro-rs" || true
+              tar -C "$d" -czf "../dist/${NAME}.tar.gz" xkiro-rs
+            fi
+          done
+          cd ..
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: xkiro-rs ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*

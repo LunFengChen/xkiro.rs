@@ -1,9 +1,9 @@
 services:
-  kiro-rs:
+  xkiro-rs:
     # 使用国内镜像
-    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
-    container_name: kiro-rs
+    # image: ghcr.nju.edu.cn/${IMAGE_OWNER:-qixia881}/xkiro-rs:${IMAGE_TAG:-latest}
+    image: ghcr.io/${IMAGE_OWNER:-qixia881}/xkiro-rs:${IMAGE_TAG:-latest}
+    container_name: xkiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

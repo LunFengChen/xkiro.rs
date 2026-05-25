@@ -904,41 +904,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kiro-rs"
-version = "2026.3.1"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crc",
- "fastrand",
- "futures",
- "hex",
- "http",
- "image",
- "mime_guess",
- "parking_lot",
- "regex",
- "reqwest",
- "rust-embed",
- "serde",
- "serde_cbor",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "unicode-segmentation",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2490,6 +2455,41 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xkiro-rs"
+version = "2026.5.26"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crc",
+ "fastrand",
+ "futures",
+ "hex",
+ "http",
+ "image",
+ "mime_guess",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "urlencoding",
+ "uuid",
+]
 
 [[package]]
 name = "yoke"
