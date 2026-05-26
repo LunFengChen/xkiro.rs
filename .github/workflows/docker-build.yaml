@@ -1,9 +1,6 @@
 name: Build and Push Docker Images
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -38,12 +35,7 @@ jobs:
 
       - name: Determine version
         id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
+        run: echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
