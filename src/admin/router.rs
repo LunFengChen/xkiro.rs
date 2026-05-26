@@ -7,7 +7,7 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, delete_user_preset, export_token_json,
+        add_credential, delete_credential, delete_user_preset, export_kam, export_token_json,
         force_refresh_balances_batch, force_refresh_token, force_refresh_tokens_batch,
         get_all_credentials, get_cached_balances, get_compression_config, get_credential_balance,
         get_credential_models, get_global_config, get_proxy_config, get_runtime_stats,
@@ -63,6 +63,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/export-token-json",
             post(export_token_json),
         )
+        .route("/credentials/export-kam", post(export_kam))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))

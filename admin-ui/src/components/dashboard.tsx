@@ -18,7 +18,7 @@ import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson } from '@/api/credentials'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -589,6 +589,41 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  // KAM 兼容导出（kiro-account-manager 可直接 import）
+  const handleBatchExportKam = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要导出的凭据')
+      return
+    }
+    try {
+      const ids = Array.from(selectedIds)
+      const items = await exportKam(ids)
+      if (items.length === 0) {
+        toast.warning('未导出任何凭据（API Key / 缺 refreshToken）')
+        return
+      }
+      const json = JSON.stringify(items, null, 2)
+      const blob = new Blob([json], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const today = new Date().toISOString().slice(0, 10)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `kiro-accounts-${items.length}-${today}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      const skipped = ids.length - items.length
+      toast.success(
+        skipped > 0
+          ? `已导出 ${items.length} 项 (KAM)，跳过 ${skipped} 项`
+          : `已导出 ${items.length} 项 (KAM)`
+      )
+    } catch (error) {
+      toast.error(`导出失败：${extractErrorMessage(error)}`)
+    }
+  }
+
   // 批量验活
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -819,6 +854,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Button onClick={handleBatchExport} size="sm" variant="outline" className="h-8">
                   <Download className="h-3.5 w-3.5 mr-1.5" />
                   批量导出
+                </Button>
+                <Button onClick={handleBatchExportKam} size="sm" variant="outline" className="h-8" title="导出为 kiro-account-manager 兼容格式">
+                  <Download className="h-3.5 w-3.5 mr-1.5" />
+                  导出KAM
                 </Button>
                 <Button
                   onClick={handleBatchDelete}

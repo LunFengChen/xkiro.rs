@@ -525,6 +525,56 @@ fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+// ============ 导出 KAM 兼容格式 ============
+
+/// KAM 导出请求（POST body）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportKamRequest {
+    pub ids: Vec<u64>,
+}
+
+/// KAM 兼容账号项（对齐 `kiro-account-manager/src-tauri/src/core/account.rs::Account`）
+///
+/// 字段命名 camelCase；`None` 字段省略以保持文件简洁。
+/// `authMethod` 使用大写 `IdC` / 小写 `social`（KAM 约定）。
+/// `provider` 取值：`Google` / `Github` / `BuilderId` / `Enterprise` / `Social`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportKamItem {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub label: String,
+    pub status: String,
+    pub added_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    pub enabled: bool,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

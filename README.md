@@ -49,6 +49,7 @@
 | 图像压缩 | 长边、单图像素、多图像素、张数阈值四档可调 |
 | Unicode 安全截断 | UAX #29 grapheme cluster，emoji / 中日韩不会被腰斩 |
 | 流式 permit 提前释放 | 上游消费完就归还，不被慢客户端拖死并发 |
+| MCP/tool_result JSON 紧凑化 | 工具返回若是合法 JSON（首字符 `{`/`[`）自动 parse + 去空白；非 JSON 文本（Markdown / stdout / 错误消息）原样保留 |
 
 ### 系统提示注入
 
@@ -90,6 +91,7 @@ Layer-1 四个内置开关：
 | 能力 | 说明 |
 |------|------|
 | 凭据 CRUD | 单条增删改 + 批量导入 token.json |
+| 凭据导出 | 按 ID 导出 token.json 兼容格式 / KAM (`kiro-account-manager`) `Account[]` 兼容格式，可在两套工具间双向迁移 |
 | 配置热更新 | region / endpoint / 全局代理 / 单凭据代理 |
 | 压缩配置 | 压缩管线全字段在线改 |
 | 提示词配置 | 清洗规则、注入开关、预设、用户规则 |
@@ -106,7 +108,8 @@ Layer-1 四个内置开关：
 | 凭据卡片 | 双进度条（主余额 + 超额额度），剩余额度直读 |
 | 实时刷新 | `/credentials/runtime-stats` 1s 轮询并发 / 余额，仅前端可见时跑（切 tab / 失焦 / 2min 无交互自动停） |
 | 超额开关 | 乐观更新，点完立即反馈 |
-| 批量导入 | 一键导入 token.json |
+| 批量导入 | 一键导入 token.json / KAM 账号 JSON，**支持文件拖入读取** |
+| 批量导出 | 选中凭据导出 token.json 或 KAM `Account[]` 兼容格式（自动识别 social/idc，跳过 API Key 凭据） |
 | 运行时统计 | 每凭据并发、已完成、排队中 |
 | 压缩面板 | 11 字段可视化编辑 |
 | 清洗开关 | 4 个内置过滤器 + 用户规则增删 |
@@ -122,7 +125,7 @@ Layer-1 四个内置开关：
 - **[hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)** — 直接上游。Anthropic ↔ Kiro 转换、Token 管理、流式协议、Admin 基座
 - **[BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs)** — 调度策略、会话亲和、后台余额刷新、压缩思路、批量导入格式参考来源
 - **[seven7763/kiro.rs](https://github.com/seven7763/kiro.rs)** — 系统提示注入与双层清洗框架的参考实现
-- **kiro-account-manager (KAM)** — Tauri 形态的 Kiro 账号管理器，其内置 gateway 的 prompt_filter / 工具命名映射 / schema 归一化等思路被本项目参考
+- **[hj01857655/kiro-account-manager](https://github.com/hj01857655/kiro-account-manager)** (KAM) — Tauri 形态的 Kiro 账号管理器，其内置 gateway 的 prompt_filter / 工具命名映射 / schema 归一化等思路被本项目参考；本项目支持导出 KAM 兼容格式 (`Account[]`) 与 KAM 双向迁移
 - **[caidaoli/kiro2api](https://github.com/caidaoli/kiro2api)** 与 **[aiclientproxy/proxycast](https://github.com/aiclientproxy/proxycast)** — 上游 README 已致谢的早期实现，启发了协议层的多个细节
 
 向所有前辈致以诚挚的感谢。

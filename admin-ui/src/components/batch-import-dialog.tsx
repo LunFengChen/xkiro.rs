@@ -421,15 +421,36 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             <label className="text-sm font-medium">
               JSON 格式凭据
             </label>
-            <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
-              value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
-              disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
-            />
+            <div
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation() }}
+              onDrop={async (e) => {
+                e.preventDefault(); e.stopPropagation()
+                if (importing) return
+                const file = e.dataTransfer.files?.[0]
+                if (!file) return
+                if (!/\.(json|txt)$/i.test(file.name) && file.type && !file.type.includes('json') && !file.type.includes('text')) {
+                  toast.error('仅支持 .json / 文本文件')
+                  return
+                }
+                try {
+                  const text = await file.text()
+                  setJsonInput(text)
+                  toast.success(`已读取 ${file.name}`)
+                } catch (err) {
+                  toast.error('读取文件失败：' + extractErrorMessage(err))
+                }
+              }}
+            >
+              <textarea
+                placeholder={'粘贴或拖入 JSON 文件（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+                value={jsonInput}
+                onChange={(e) => setJsonInput(e.target.value)}
+                disabled={importing}
+                className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+            </div>
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              💡 拖入 .json 文件可直接读取；导入时自动验活，失败的凭据会被排除
             </p>
           </div>
 

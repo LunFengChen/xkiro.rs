@@ -3019,6 +3019,24 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 按 ID 列表导出凭据 + 启用状态（用于 KAM 兼容格式导出）
+    ///
+    /// 返回 `(credentials, enabled)`；顺序与 `ids` 相同；不存在的 ID 跳过。
+    pub fn export_credentials_with_state_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> Vec<(KiroCredentials, bool)> {
+        let entries = self.entries.lock();
+        ids.iter()
+            .filter_map(|id| {
+                entries
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .map(|e| (e.credentials.clone(), !e.disabled))
+            })
+            .collect()
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程

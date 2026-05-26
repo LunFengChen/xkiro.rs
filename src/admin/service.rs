@@ -24,8 +24,9 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ExportTokenJsonItem, GlobalConfigResponse, ImportAction,
-    ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse, PresetItem,
+    CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
+    ImportAction, ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
+    PresetItem,
     ProxyConfigResponse, RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse,
     SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
     UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
@@ -1885,6 +1886,105 @@ impl AdminService {
                     region: c.region,
                     api_region: c.api_region,
                     machine_id: c.machine_id,
+                })
+            })
+            .collect()
+    }
+
+    /// 按 ID 列表导出 KAM 兼容格式（`kiro-account-manager` 可直接 import）
+    ///
+    /// - API Key 凭据跳过（KAM 仅支持 OAuth）
+    /// - `id` 用 UUIDv4 派生（KAM 用字符串 ID，xkiro 用 u64，需重映射避免冲突）
+    /// - `label` 用 email 优先，否则用 `Kiro #{id}` 占位
+    /// - `provider` 优先级：subscription_title 启发 → start_url → email 域名 → 默认
+    ///   - idc + start_url 含 `awsapps.com` → `Enterprise`
+    ///   - idc → `BuilderId`
+    ///   - social + email 含 `gmail` → `Google`
+    ///   - social + email 含 `github` → `Github`
+    ///   - social → `Google`（默认）
+    /// - `authMethod` 取大写 `IdC` / 小写 `social`（KAM 约定）
+    /// - `addedAt` 用 RFC3339 当前时间（xkiro 不存添加时间）
+    pub fn export_credentials_to_kam(&self, ids: &[u64]) -> Vec<ExportKamItem> {
+        let creds = self
+            .token_manager
+            .export_credentials_with_state_by_ids(ids);
+        let now = chrono::Local::now().to_rfc3339();
+        creds
+            .into_iter()
+            .filter_map(|(c, enabled)| {
+                let refresh_token = c.refresh_token.clone()?;
+                if refresh_token.is_empty() {
+                    return None;
+                }
+                let auth_method_lower = c
+                    .auth_method
+                    .as_deref()
+                    .map(|m| m.to_lowercase())
+                    .unwrap_or_else(|| "social".to_string());
+                if auth_method_lower == "api_key" {
+                    return None;
+                }
+                let is_idc = matches!(
+                    auth_method_lower.as_str(),
+                    "idc" | "builder-id" | "builderid" | "iam"
+                );
+                let auth_method = if is_idc {
+                    "IdC".to_string()
+                } else {
+                    "social".to_string()
+                };
+                let provider = if is_idc {
+                    if c.client_secret
+                        .as_deref()
+                        .map(|s| s.contains("awsapps.com") || s.contains("initiateLoginUri"))
+                        .unwrap_or(false)
+                    {
+                        "Enterprise".to_string()
+                    } else {
+                        "BuilderId".to_string()
+                    }
+                } else if let Some(email) = c.email.as_deref() {
+                    if email.contains("gmail") {
+                        "Google".to_string()
+                    } else if email.contains("github") {
+                        "Github".to_string()
+                    } else {
+                        "Google".to_string()
+                    }
+                } else {
+                    "Google".to_string()
+                };
+                let id_str = c
+                    .id
+                    .map(|n| format!("xkiro-{}", n))
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let label = c
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| match c.id {
+                        Some(n) => format!("Kiro #{}", n),
+                        None => "Kiro Account".to_string(),
+                    });
+                let status = if enabled { "active" } else { "disabled" };
+                Some(ExportKamItem {
+                    id: id_str,
+                    email: c.email.clone(),
+                    label,
+                    status: status.to_string(),
+                    added_at: now.clone(),
+                    access_token: c.access_token,
+                    refresh_token: Some(refresh_token),
+                    expires_at: c.expires_at,
+                    provider: Some(provider),
+                    user_id: c.email.clone(),
+                    auth_method: Some(auth_method),
+                    client_id: c.client_id,
+                    client_secret: c.client_secret,
+                    region: c.region,
+                    start_url: None,
+                    profile_arn: c.profile_arn,
+                    machine_id: c.machine_id,
+                    enabled,
                 })
             })
             .collect()

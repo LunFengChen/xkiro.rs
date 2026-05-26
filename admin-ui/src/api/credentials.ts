@@ -257,6 +257,36 @@ export async function exportTokenJson(ids: number[]): Promise<ExportTokenJsonIte
   return data
 }
 
+// KAM (kiro-account-manager) 兼容导出项
+export interface ExportKamItem {
+  id: string
+  email?: string
+  label: string
+  status: string
+  addedAt: string
+  accessToken?: string
+  refreshToken?: string
+  expiresAt?: string
+  provider?: string
+  userId?: string
+  authMethod?: string
+  clientId?: string
+  clientSecret?: string
+  region?: string
+  startUrl?: string
+  profileArn?: string
+  machineId?: string
+  enabled: boolean
+}
+
+export async function exportKam(ids: number[]): Promise<ExportKamItem[]> {
+  const { data } = await api.post<ExportKamItem[]>(
+    '/credentials/export-kam',
+    { ids },
+  )
+  return data
+}
+
 // 获取所有凭据缓存余额（首屏预填，避免手动查询）
 export async function getCachedBalances(): Promise<import('../types/api').CachedBalancesResponse> {
   const { data } = await api.get<import('../types/api').CachedBalancesResponse>(

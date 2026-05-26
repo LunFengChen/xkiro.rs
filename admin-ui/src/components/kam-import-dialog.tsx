@@ -415,13 +415,35 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <label className="text-sm font-medium">KAM 导出 JSON</label>
-            <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
-              value={jsonInput}
-              onChange={(e) => setJsonInput(e.target.value)}
-              disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
-            />
+            <div
+              onDragOver={(e) => { e.preventDefault(); e.stopPropagation() }}
+              onDrop={async (e) => {
+                e.preventDefault(); e.stopPropagation()
+                if (importing) return
+                const file = e.dataTransfer.files?.[0]
+                if (!file) return
+                if (!/\.(json|txt)$/i.test(file.name) && file.type && !file.type.includes('json') && !file.type.includes('text')) {
+                  toast.error('仅支持 .json / 文本文件')
+                  return
+                }
+                try {
+                  const text = await file.text()
+                  setJsonInput(text)
+                  toast.success(`已读取 ${file.name}`)
+                } catch (err) {
+                  toast.error('读取文件失败：' + extractErrorMessage(err))
+                }
+              }}
+            >
+              <textarea
+                placeholder={'粘贴或拖入 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+                value={jsonInput}
+                onChange={(e) => setJsonInput(e.target.value)}
+                disabled={importing}
+                className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">💡 拖入 .json 文件可直接读取</p>
           </div>
 
           {/* 解析预览 */}

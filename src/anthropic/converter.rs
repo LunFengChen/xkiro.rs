@@ -925,6 +925,28 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+/// 若 `s` 看起来是 JSON（首个非空白字符为 `{` 或 `[`），尝试 parse + 紧凑化，
+/// 否则或 parse 失败原样返回。用于压缩 MCP 工具返回的 pretty-printed JSON，节省 token。
+///
+/// 判断策略（先廉价 sniff，再走 parse 兜底）：
+/// 1. trim_start 后首字符不是 `{` / `[` → 当作纯文本（Markdown / stdout / 错误消息 / 标量）直接返回
+/// 2. 首字符匹配但 parse 失败 → 原样返回（保守：不破坏带噪声的伪 JSON）
+/// 3. parse 成功 → `serde_json::to_string` 输出紧凑形式（无空白、无换行）
+///
+/// 性能：serde_json round-trip。MCP 返回通常 <100KB，亚毫秒级；不引入 SIMD 依赖。
+fn compact_json_if_possible(s: &str) -> String {
+    let trimmed = s.trim_start();
+    let first = trimmed.as_bytes().first().copied();
+    if matches!(first, Some(b'{') | Some(b'[')) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Ok(compact) = serde_json::to_string(&v) {
+                return compact;
+            }
+        }
+    }
+    s.to_string()
+}
+
 /// 提取 tool_result 的 content 字段并归一化为字符串
 ///
 /// 对齐 KAM `ParseToolResultContent`：
@@ -941,7 +963,7 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
             return if s.is_empty() {
                 "Tool executed with no output".to_string()
             } else {
-                s.clone()
+                compact_json_if_possible(s)
             };
         }
         Some(Value::Array(arr)) if arr.is_empty() => {
@@ -954,14 +976,14 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
                     Value::Object(map) => {
                         let text = map.get("text").and_then(|v| v.as_str()).unwrap_or("");
                         if !text.is_empty() {
-                            parts.push(text.to_string());
+                            parts.push(compact_json_if_possible(text));
                         } else if map.contains_key("text") {
                             // 显式 text 字段为空：跳过，触发"全空 → 占位"路径
                         } else {
                             parts.push(serde_json::to_string(map).unwrap_or_default());
                         }
                     }
-                    Value::String(s) if !s.is_empty() => parts.push(s.clone()),
+                    Value::String(s) if !s.is_empty() => parts.push(compact_json_if_possible(s)),
                     Value::String(_) => {}
                     Value::Null => {}
                     other => parts.push(other.to_string()),
@@ -981,14 +1003,14 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
                 return if text.is_empty() {
                     "Tool executed with empty text".to_string()
                 } else {
-                    text.to_string()
+                    compact_json_if_possible(text)
                 };
             }
             if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
                 return if text.is_empty() {
                     "Tool executed with empty text field".to_string()
                 } else {
-                    text.to_string()
+                    compact_json_if_possible(text)
                 };
             }
             return serde_json::to_string(map)

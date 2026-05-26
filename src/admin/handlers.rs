@@ -9,7 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchRefreshRequest, ExportTokenJsonRequest, ImportTokenJsonRequest,
+        AddCredentialRequest, BatchRefreshRequest, ExportKamRequest, ExportTokenJsonRequest,
+        ImportTokenJsonRequest,
         SetConcurrencyRequest, SetDisabledRequest, SetEndpointRequest, SetOverageRequest,
         SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
@@ -222,6 +223,23 @@ pub async fn export_token_json(
             .into_response();
     }
     let items = state.service.export_credentials_to_token_json(&payload.ids);
+    Json(items).into_response()
+}
+
+/// POST /api/admin/credentials/export-kam
+/// 按 ID 列表导出 KAM (`kiro-account-manager`) 兼容格式（Account[] JSON）
+pub async fn export_kam(
+    State(state): State<AdminState>,
+    Json(payload): Json<ExportKamRequest>,
+) -> impl IntoResponse {
+    if payload.ids.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "ids 不能为空"})),
+        )
+            .into_response();
+    }
+    let items = state.service.export_credentials_to_kam(&payload.ids);
     Json(items).into_response()
 }
 
