@@ -18,7 +18,7 @@ use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::Args;
+use model::arg::{Args, Command};
 use model::config::Config;
 use parking_lot::RwLock;
 
@@ -26,6 +26,18 @@ use parking_lot::RwLock;
 async fn main() {
     // 解析命令行参数
     let args = Args::parse();
+
+    // 子命令优先：init 走交互式向导直接退出，不进入服务启动流程
+    if let Some(Command::Init { force }) = args.command {
+        let config_path = args
+            .config
+            .unwrap_or_else(|| Config::default_config_path().to_string());
+        if let Err(e) = model::init::run_init(std::path::Path::new(&config_path), force) {
+            eprintln!("初始化失败: {:#}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // 初始化日志
     tracing_subscriber::fmt()

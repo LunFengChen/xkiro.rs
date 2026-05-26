@@ -2,4 +2,5 @@
 
 pub mod arg;
 pub mod config;
+pub mod init;
 pub mod runtime;
