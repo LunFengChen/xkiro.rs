@@ -100,17 +100,27 @@ impl BackgroundRefresher {
     /// # Arguments
     /// * `refresh_fn` - 刷新函数，接收凭据 ID，返回是否成功
     /// * `get_expiring_ids_fn` - 获取即将过期的凭据 ID 列表
+    /// * `post_tick_fn` - 每个 tick 末尾执行一次（无论是否有过期 token），用于被禁用凭据的定时重试等
     ///
     /// # Returns
     /// - `Ok(())` - 启动成功
     /// - `Err(String)` - 配置无效或已在运行
-    pub fn start<F, G>(&self, refresh_fn: F, get_expiring_ids_fn: G) -> Result<(), String>
+    pub fn start<F, G, H>(
+        &self,
+        refresh_fn: F,
+        get_expiring_ids_fn: G,
+        post_tick_fn: H,
+    ) -> Result<(), String>
     where
         F: Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
             + Send
             + Sync
             + 'static,
         G: Fn(i64) -> Vec<u64> + Send + Sync + 'static,
+        H: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         // P1 修复：启动前校验配置，避免 panic/hang
         if let Err(e) = self.config.validate() {
@@ -127,6 +137,7 @@ impl BackgroundRefresher {
         let running = Arc::clone(&self.running);
         let shutdown_notify = Arc::clone(&self.shutdown_notify);
         let refresh_fn = Arc::new(refresh_fn);
+        let post_tick_fn = Arc::new(post_tick_fn);
 
         tokio::spawn(async move {
             tracing::info!(
@@ -150,47 +161,49 @@ impl BackgroundRefresher {
 
                         if expiring_ids.is_empty() {
                             tracing::debug!("没有需要刷新的 Token");
-                            continue;
-                        }
+                        } else {
+                            tracing::info!("发现 {} 个即将过期的 Token，开始刷新", expiring_ids.len());
 
-                        tracing::info!("发现 {} 个即将过期的 Token，开始刷新", expiring_ids.len());
+                            // 批量刷新
+                            let mut success_count = 0;
+                            let mut fail_count = 0;
 
-                        // 批量刷新
-                        let mut success_count = 0;
-                        let mut fail_count = 0;
+                            for chunk in expiring_ids.chunks(config.batch_size) {
+                                let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+                                let mut handles = Vec::new();
 
-                        for chunk in expiring_ids.chunks(config.batch_size) {
-                            let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
-                            let mut handles = Vec::new();
+                                for &id in chunk {
+                                    let permit = semaphore.clone().acquire_owned().await;
+                                    let refresh_fn = Arc::clone(&refresh_fn);
 
-                            for &id in chunk {
-                                let permit = semaphore.clone().acquire_owned().await;
-                                let refresh_fn = Arc::clone(&refresh_fn);
+                                    let handle = tokio::spawn(async move {
+                                        let _permit = permit;
+                                        refresh_fn(id).await
+                                    });
+                                    handles.push(handle);
+                                }
 
-                                let handle = tokio::spawn(async move {
-                                    let _permit = permit;
-                                    refresh_fn(id).await
-                                });
-                                handles.push(handle);
-                            }
-
-                            for handle in handles {
-                                match handle.await {
-                                    Ok(true) => success_count += 1,
-                                    Ok(false) => fail_count += 1,
-                                    Err(e) => {
-                                        tracing::warn!("刷新任务 panic: {}", e);
-                                        fail_count += 1;
+                                for handle in handles {
+                                    match handle.await {
+                                        Ok(true) => success_count += 1,
+                                        Ok(false) => fail_count += 1,
+                                        Err(e) => {
+                                            tracing::warn!("刷新任务 panic: {}", e);
+                                            fail_count += 1;
+                                        }
                                     }
                                 }
                             }
+
+                            tracing::info!(
+                                success = %success_count,
+                                failed = %fail_count,
+                                "后台 Token 刷新完成"
+                            );
                         }
 
-                        tracing::info!(
-                            success = %success_count,
-                            failed = %fail_count,
-                            "后台 Token 刷新完成"
-                        );
+                        // 每个 tick 末尾执行：被禁用凭据的定时重试 + 到上限删除
+                        post_tick_fn().await;
                     }
                     _ = shutdown_notify.notified() => {
                         tracing::info!("后台 Token 刷新器收到关闭信号");
@@ -332,7 +345,11 @@ mod tests {
         let refresher = BackgroundRefresher::with_defaults();
 
         // 启动一个空的刷新任务
-        let _ = refresher.start(|_id| Box::pin(async { true }), |_mins| vec![]);
+        let _ = refresher.start(
+            |_id| Box::pin(async { true }),
+            |_mins| vec![],
+            || Box::pin(async {}),
+        );
 
         // 等待启动
         tokio::time::sleep(Duration::from_millis(100)).await;

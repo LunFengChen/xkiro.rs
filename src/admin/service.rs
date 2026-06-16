@@ -390,6 +390,8 @@ impl AdminService {
                 available_permits: entry.available_permits,
                 max_permits: entry.max_permits,
                 concurrency: entry.concurrency,
+                recovery_attempts: entry.recovery_attempts,
+                next_retry_at: entry.next_retry_at,
             })
             .collect();
 
@@ -726,7 +728,7 @@ impl AdminService {
         // 调用 token_manager 添加凭据
         let credential_id = self
             .token_manager
-            .add_credential(new_cred)
+            .add_credential(new_cred, true)
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
@@ -2022,22 +2024,59 @@ impl AdminService {
     /// - BuilderId/builder-id/idc → idc
     /// - Social/social → social
     pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+        use futures::stream::{self, StreamExt};
+
         let items = req.items.into_vec();
         let dry_run = req.dry_run;
 
-        let mut results = Vec::with_capacity(items.len());
+        /// 导入并发度：5 路并发刷新首验，兼顾速度与上游限流
+        const IMPORT_CONCURRENCY: usize = 5;
+
+        // 同一请求内按 refreshToken 去重，避免并发下两条相同 token 同时通过去重检查
+        let mut seen_tokens = std::collections::HashSet::new();
+        let prepared: Vec<(usize, TokenJsonItem, bool)> = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let dup_in_batch = item
+                    .refresh_token
+                    .as_ref()
+                    .map(|rt| !seen_tokens.insert(rt.clone()))
+                    .unwrap_or(false);
+                (index, item, dup_in_batch)
+            })
+            .collect();
+
+        // 并发处理；buffer_unordered 限制在途任务数，结果顺序随完成顺序，最后按 index 排序
+        let mut results: Vec<ImportItemResult> = stream::iter(prepared)
+            .map(|(index, item, dup_in_batch)| async move {
+                if dup_in_batch {
+                    let fingerprint = Self::generate_fingerprint(&item);
+                    return ImportItemResult {
+                        index,
+                        fingerprint,
+                        action: ImportAction::Skipped,
+                        reason: Some("本次导入中重复的 refreshToken".to_string()),
+                        credential_id: None,
+                    };
+                }
+                self.process_token_json_item(index, item, dry_run).await
+            })
+            .buffer_unordered(IMPORT_CONCURRENCY)
+            .collect()
+            .await;
+
+        results.sort_by_key(|r| r.index);
+
         let mut added = 0usize;
         let mut skipped = 0usize;
         let mut invalid = 0usize;
-
-        for (index, item) in items.into_iter().enumerate() {
-            let result = self.process_token_json_item(index, item, dry_run).await;
+        for result in &results {
             match result.action {
                 ImportAction::Added => added += 1,
                 ImportAction::Skipped => skipped += 1,
                 ImportAction::Invalid => invalid += 1,
             }
-            results.push(result);
         }
 
         ImportTokenJsonResponse {
@@ -2145,14 +2184,23 @@ impl AdminService {
             concurrency: None,
         };
 
-        match self.token_manager.add_credential(new_cred).await {
-            Ok(credential_id) => ImportItemResult {
-                index,
-                fingerprint,
-                action: ImportAction::Added,
-                reason: None,
-                credential_id: Some(credential_id),
-            },
+        match self.token_manager.add_credential(new_cred, false).await {
+            Ok(credential_id) => {
+                // validate=false：首刷失败也会入池为禁用态，交给后台定时重试。
+                // 这里据实告知用户该号是「已激活」还是「已入池待自动重试」。
+                let pending_retry = self.token_manager.is_credential_disabled(credential_id);
+                ImportItemResult {
+                    index,
+                    fingerprint,
+                    action: ImportAction::Added,
+                    reason: if pending_retry {
+                        Some("已入池，首次验证失败，将自动重试".to_string())
+                    } else {
+                        None
+                    },
+                    credential_id: Some(credential_id),
+                }
+            }
             Err(e) => ImportItemResult {
                 index,
                 fingerprint,

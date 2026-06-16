@@ -65,6 +65,12 @@ pub struct CredentialStatusItem {
 
     /// 凭据级并发上限配置（None=回退全局 per_credential_concurrency）
     pub concurrency: Option<u32>,
+
+    /// 自动恢复重试次数（被自动禁用后，后台定时重试已尝试的次数）
+    pub recovery_attempts: u32,
+    /// 下一次自动重试时间（RFC3339；None=不参与自动重试或已耗尽次数）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<String>,
 }
 
 // ============ 操作请求 ============

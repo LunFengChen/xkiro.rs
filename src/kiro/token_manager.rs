@@ -498,6 +498,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 被自动禁用的时刻（Manual 禁用不填，不参与自动重试）
+    disabled_at: Option<DateTime<Utc>>,
+    /// 自动重试已尝试次数（用于退避表 + 判断是否到删除上限）
+    recovery_attempts: u32,
 }
 
 /// 禁用原因
@@ -586,6 +590,11 @@ pub struct CredentialEntrySnapshot {
     pub max_permits: usize,
     /// 凭据级并发配置（None=回退全局 per_credential_concurrency）
     pub concurrency: Option<u32>,
+    /// 自动恢复重试次数
+    pub recovery_attempts: u32,
+    /// 下一次自动重试时间（RFC3339；None=不参与自动重试或已耗尽）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -670,6 +679,11 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 被禁用凭据自动重试的退避间隔（分钟），第 N 次重试等第 N 个间隔后执行。
+/// attempts >= len() 仍失败则自动删除。
+const RETRY_BACKOFF_MINUTES: [i64; 5] = [10, 30, 60, 180, 360];
+
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -690,6 +704,51 @@ pub const LOW_BALANCE_THRESHOLD: f64 = 1.0;
 const MODEL_UNAVAILABLE_THRESHOLD: u32 = 2;
 /// 全局禁用自动恢复延迟（分钟）
 const GLOBAL_DISABLE_RECOVERY_MINUTES: i64 = 5;
+
+/// 统一设置凭据为自动禁用态（非 Manual）
+fn mark_entry_disabled(entry: &mut CredentialEntry, reason: DisabledReason) {
+    entry.disabled = true;
+    entry.disabled_reason = Some(reason);
+    entry.disabled_at = Some(Utc::now());
+    entry.recovery_attempts = 0;
+}
+
+/// 判断被禁用凭据是否到了下一次重试时间
+///
+/// 按退避表 RETRY_BACKOFF_MINUTES 递增间隔，attempts >= len() 返回 false（交给删除逻辑）。
+fn due_for_retry(disabled_at: DateTime<Utc>, recovery_attempts: u32, now: DateTime<Utc>) -> bool {
+    let idx = recovery_attempts as usize;
+    if idx >= RETRY_BACKOFF_MINUTES.len() {
+        return false;
+    }
+    let wait = Duration::minutes(RETRY_BACKOFF_MINUTES[idx]);
+    now >= disabled_at + wait
+}
+
+/// 计算下一次自动重试时间（用于 DTO 展示）
+///
+/// 返回 None 的情况：未禁用 / Manual / InvalidConfig / 缺 disabled_at / 重试次数已耗尽。
+fn next_retry_at_for(
+    disabled: bool,
+    reason: Option<DisabledReason>,
+    disabled_at: Option<DateTime<Utc>>,
+    recovery_attempts: u32,
+) -> Option<String> {
+    if !disabled {
+        return None;
+    }
+    match reason {
+        Some(DisabledReason::Manual) | Some(DisabledReason::InvalidConfig) | None => return None,
+        _ => {}
+    }
+    let disabled_at = disabled_at?;
+    let idx = recovery_attempts as usize;
+    if idx >= RETRY_BACKOFF_MINUTES.len() {
+        return None;
+    }
+    let next = disabled_at + Duration::minutes(RETRY_BACKOFF_MINUTES[idx]);
+    Some(next.to_rfc3339())
+}
 
 /// API 调用上下文
 ///
@@ -783,6 +842,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    disabled_at: None,
+                    recovery_attempts: 0,
                 }
             })
             .collect();
@@ -802,8 +863,7 @@ impl MultiTokenManager {
                     "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
                     entry.id
                 );
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                mark_entry_disabled(entry, DisabledReason::InvalidConfig);
             }
         }
 
@@ -1559,8 +1619,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::AuthenticationFailed);
+                mark_entry_disabled(entry, DisabledReason::AuthenticationFailed);
                 tracing::warn!("凭据 #{} 已标记为认证失败", id);
             }
         }
@@ -1572,8 +1631,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                mark_entry_disabled(entry, DisabledReason::AccountSuspended);
                 tracing::warn!("凭据 #{} 已标记为账户暂停", id);
             }
         }
@@ -1583,8 +1641,7 @@ impl MultiTokenManager {
     pub fn mark_insufficient_balance(&self, id: u64) {
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::InsufficientBalance);
+            mark_entry_disabled(entry, DisabledReason::InsufficientBalance);
             tracing::warn!("凭据 #{} 已标记为余额不足", id);
         }
     }
@@ -2193,8 +2250,7 @@ impl MultiTokenManager {
             );
 
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                mark_entry_disabled(entry, DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 if !entries.iter().any(|e| !e.disabled) {
@@ -2227,8 +2283,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            mark_entry_disabled(entry, DisabledReason::QuotaExceeded);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
@@ -2277,8 +2332,7 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+            mark_entry_disabled(entry, DisabledReason::TooManyRefreshFailures);
 
             tracing::error!(
                 "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
@@ -2317,8 +2371,7 @@ impl MultiTokenManager {
             }
 
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+            mark_entry_disabled(entry, DisabledReason::InvalidRefreshToken);
 
             tracing::error!(
                 "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
@@ -2341,6 +2394,16 @@ impl MultiTokenManager {
     // ========================================================================
 
     /// 获取管理器状态快照（用于 Admin API）
+    /// 查询指定凭据当前是否处于禁用态（用于导入后判断是否首刷失败入池）
+    pub fn is_credential_disabled(&self, id: u64) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.disabled)
+            .unwrap_or(false)
+    }
+
     pub fn snapshot(&self) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -2418,6 +2481,13 @@ impl MultiTokenManager {
                         .map(|v| (v as usize).max(1))
                         .unwrap_or(global_per_cred),
                     concurrency: e.credentials.concurrency,
+                    recovery_attempts: e.recovery_attempts,
+                    next_retry_at: next_retry_at_for(
+                        e.disabled,
+                        e.disabled_reason,
+                        e.disabled_at,
+                        e.recovery_attempts,
+                    ),
                 })
                 .collect(),
             total: entries.len(),
@@ -2615,6 +2685,8 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.disabled_at = None;
+            entry.recovery_attempts = 0;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -3076,7 +3148,7 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(&self, new_cred: KiroCredentials, validate: bool) -> anyhow::Result<u64> {
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -3136,14 +3208,26 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
-            new_cred.clone()
+        //    validate=false 时首刷失败也入池（标禁用，交给定时重试兜底）
+        let (validated_cred, validation_failed) = if new_cred.is_api_key_credential() {
+            (new_cred.clone(), false)
         } else {
             let proxy_snap = self.proxy.read().clone();
             let config_snap = self.config.read().clone();
             let effective_proxy = new_cred.effective_proxy(proxy_snap.as_ref());
-            refresh_token(&new_cred, &config_snap, effective_proxy.as_ref()).await?
+            match refresh_token(&new_cred, &config_snap, effective_proxy.as_ref()).await {
+                Ok(refreshed) => (refreshed, false),
+                Err(e) => {
+                    if validate {
+                        return Err(e);
+                    }
+                    // validate=false: 首刷失败也入池，用原始凭据
+                    tracing::warn!("凭据首刷失败（将入池为禁用态，等待自动重试）: {}", e);
+                    (new_cred.clone(), true)
+                }
+            }
         };
+        let mut validated_cred = validated_cred;
 
         // 4. 分配新 ID
         let new_id = {
@@ -3194,10 +3278,16 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
-                disabled_reason: None,
+                disabled: validation_failed,
+                disabled_reason: if validation_failed {
+                    Some(DisabledReason::TooManyRefreshFailures)
+                } else {
+                    None
+                },
                 success_count: 0,
                 last_used_at: None,
+                disabled_at: if validation_failed { Some(Utc::now()) } else { None },
+                recovery_attempts: 0,
             });
         }
 
@@ -3259,7 +3349,106 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 强制刷新指定凭据的 Token（Admin API）
+    /// 重试被自动禁用的凭据（后台循环周期调用）
+    ///
+    /// 行为：
+    /// - 跳过 Manual（用户手动禁用）和 InvalidConfig（需改配置重启）
+    /// - recovery_attempts 已达退避表上限且仍失败 → 自动删除该凭据
+    /// - 到了退避间隔的 → 探活：成功则 reset_and_enable 回池，失败则保持禁用、attempts +1
+    pub async fn retry_disabled_credentials(&self) {
+        let now = Utc::now();
+
+        // 1. 锁内收集候选，避免长时间持锁做网络 IO
+        let (to_retry, to_delete): (Vec<u64>, Vec<u64>) = {
+            let entries = self.entries.lock();
+            let mut retry = Vec::new();
+            let mut delete = Vec::new();
+            for entry in entries.iter() {
+                if !entry.disabled {
+                    continue;
+                }
+                // 仅自动禁用参与重试；Manual / InvalidConfig 豁免
+                match entry.disabled_reason {
+                    Some(DisabledReason::Manual) | Some(DisabledReason::InvalidConfig) | None => {
+                        continue;
+                    }
+                    _ => {}
+                }
+                let disabled_at = match entry.disabled_at {
+                    Some(t) => t,
+                    None => continue, // 没有禁用时间戳的不参与（防御）
+                };
+                if entry.recovery_attempts as usize >= RETRY_BACKOFF_MINUTES.len() {
+                    // 重试次数已耗尽（且最后一次仍失败）→ 删除
+                    delete.push(entry.id);
+                } else if due_for_retry(disabled_at, entry.recovery_attempts, now) {
+                    retry.push(entry.id);
+                }
+            }
+            (retry, delete)
+        };
+
+        // 2. 删除耗尽的凭据
+        for id in to_delete {
+            match self.delete_credential(id) {
+                Ok(_) => tracing::warn!("凭据 #{} 多次重试仍失败，已自动删除", id),
+                Err(e) => tracing::warn!("自动删除凭据 #{} 失败: {}", id, e),
+            }
+        }
+
+        // 3. 重试到期的凭据
+        for id in to_retry {
+            // 先记一次尝试（无论成功失败都已 +1，避免双重回写）
+            {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    entry.recovery_attempts += 1;
+                }
+            }
+
+            // 探活：OAuth 凭据强制刷新 token；API Key 凭据查使用额度
+            let is_api_key = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.is_api_key_credential())
+                    .unwrap_or(false)
+            };
+
+            let probe = if is_api_key {
+                self.get_usage_limits_for(id).await.map(|_| ())
+            } else {
+                self.force_refresh_token_for(id).await
+            };
+
+            match probe {
+                Ok(_) => match self.reset_and_enable(id) {
+                    Ok(_) => tracing::info!("凭据 #{} 自动重试成功，已恢复入池", id),
+                    Err(e) => tracing::warn!("凭据 #{} 探活成功但恢复失败: {}", id, e),
+                },
+                Err(e) => {
+                    let attempts = {
+                        let entries = self.entries.lock();
+                        entries
+                            .iter()
+                            .find(|e| e.id == id)
+                            .map(|e| e.recovery_attempts)
+                            .unwrap_or(0)
+                    };
+                    tracing::warn!(
+                        "凭据 #{} 第 {} 次自动重试失败（共 {} 次后删除）: {}",
+                        id,
+                        attempts,
+                        RETRY_BACKOFF_MINUTES.len(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+
     ///
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
@@ -3447,6 +3636,7 @@ impl MultiTokenManager {
         let refresher = Arc::new(BackgroundRefresher::new(config.clone()));
         let manager_for_refresh = Arc::clone(self);
         let manager_for_ids = Arc::clone(self);
+        let manager_for_retry = Arc::clone(self);
         let refresh_before_mins = config.refresh_before_expiry_mins;
 
         if let Err(e) = refresher.start(
@@ -3464,6 +3654,12 @@ impl MultiTokenManager {
             },
             move |mins| {
                 manager_for_ids.get_expiring_credential_ids(mins.max(refresh_before_mins))
+            },
+            move || {
+                let manager = Arc::clone(&manager_for_retry);
+                Box::pin(async move {
+                    manager.retry_disabled_credentials().await;
+                })
             },
         ) {
             tracing::error!("启动后台刷新任务失败: {}", e);
@@ -3541,6 +3737,36 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_due_for_retry_first_attempt() {
+        let now = Utc::now();
+        let disabled_at = now - Duration::minutes(5);
+        // 第 0 次重试需等 10 分钟，才过 5 分钟 → 未到
+        assert!(!due_for_retry(disabled_at, 0, now));
+        // 过了 11 分钟 → 到了
+        assert!(due_for_retry(now - Duration::minutes(11), 0, now));
+    }
+
+    #[test]
+    fn test_due_for_retry_backoff_increases() {
+        let now = Utc::now();
+        // 第 1 次重试需等 30 分钟
+        assert!(!due_for_retry(now - Duration::minutes(20), 1, now));
+        assert!(due_for_retry(now - Duration::minutes(31), 1, now));
+        // 第 4 次重试需等 360 分钟
+        assert!(!due_for_retry(now - Duration::minutes(359), 4, now));
+        assert!(due_for_retry(now - Duration::minutes(361), 4, now));
+    }
+
+    #[test]
+    fn test_due_for_retry_exhausted_returns_false() {
+        let now = Utc::now();
+        let long_ago = now - Duration::days(30);
+        // attempts >= 退避表长度 → 永远 false（交给删除逻辑）
+        assert!(!due_for_retry(long_ago, 5, now));
+        assert!(!due_for_retry(long_ago, 99, now));
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -3641,7 +3867,7 @@ mod tests {
         let mut duplicate = KiroCredentials::default();
         duplicate.refresh_token = Some("a".repeat(150));
 
-        let result = manager.add_credential(duplicate).await;
+        let result = manager.add_credential(duplicate, true).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
     }
@@ -3655,7 +3881,7 @@ mod tests {
         api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
 
-        let result = manager.add_credential(api_key_cred).await;
+        let result = manager.add_credential(api_key_cred, true).await;
         assert!(result.is_ok());
         let id = result.unwrap();
         assert!(id > 0);
@@ -3677,7 +3903,7 @@ mod tests {
         duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
         duplicate.auth_method = Some("api_key".to_string());
 
-        let result = manager.add_credential(duplicate).await;
+        let result = manager.add_credential(duplicate, true).await;
         assert!(result.is_err());
         assert!(result
             .err()
@@ -3695,7 +3921,7 @@ mod tests {
         cred.kiro_api_key = Some(String::new());
         cred.auth_method = Some("api_key".to_string());
 
-        let result = manager.add_credential(cred).await;
+        let result = manager.add_credential(cred, true).await;
         assert!(result.is_err());
         assert!(result
             .err()
@@ -3713,7 +3939,7 @@ mod tests {
         cred.auth_method = Some("api_key".to_string());
         // kiro_api_key is None
 
-        let result = manager.add_credential(cred).await;
+        let result = manager.add_credential(cred, true).await;
         assert!(result.is_err());
         assert!(result
             .err()
@@ -3735,7 +3961,7 @@ mod tests {
         api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
         api_key_cred.auth_method = Some("api_key".to_string());
 
-        let result = manager.add_credential(api_key_cred).await;
+        let result = manager.add_credential(api_key_cred, true).await;
         assert!(result.is_ok());
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
