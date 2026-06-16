@@ -296,6 +296,12 @@ async fn main() {
                 .clone()
                 .start_periodic_balance_refresh();
 
+            // 启动代理池健康巡检（每 60s 探测；死代理上的号按 region 自动换绑）
+            admin_state
+                .service
+                .clone()
+                .start_proxy_health_patrol(60);
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

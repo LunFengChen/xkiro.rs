@@ -256,7 +256,78 @@ impl AdminService {
         });
     }
 
-    /// 并发刷新指定凭据列表的余额
+    /// 启动代理池健康巡检：每 interval_secs 经每个启用代理探测出口 IP，
+    /// 连续失败 `PROXY_DEAD_THRESHOLD` 次判 dead 踢出调度；
+    /// 刚判 dead 的代理上绑定的号，尝试按 region 自动换绑到其它可用代理。
+    ///
+    /// 探测有并发上限(默认 5)，避免一次性对所有代理发请求。
+    pub fn start_proxy_health_patrol(self: Arc<Self>, interval_secs: u64) {
+        const PATROL_CONCURRENCY: usize = 5;
+        let interval = interval_secs.max(30);
+        tokio::spawn(async move {
+            tracing::info!("代理池健康巡检已启动: 间隔 {}s", interval);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+                let ids = self.proxy_manager.enabled_ids();
+                if ids.is_empty() {
+                    continue;
+                }
+
+                let sem = Arc::new(Semaphore::new(PATROL_CONCURRENCY));
+                let mut set = JoinSet::new();
+                for id in ids {
+                    let svc = Arc::clone(&self);
+                    let sem = Arc::clone(&sem);
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await.ok()?;
+                        let entry = svc.proxy_manager.get(id)?;
+                        let res = Self::probe_proxy(&entry).await;
+                        // (just_dead, _recovered)
+                        let (just_dead, _) =
+                            svc.proxy_manager
+                                .record_health(id, res.ok, res.error.clone());
+                        Some((id, just_dead))
+                    });
+                }
+
+                let mut newly_dead = Vec::new();
+                while let Some(joined) = set.join_next().await {
+                    if let Ok(Some((id, just_dead))) = joined {
+                        if just_dead {
+                            newly_dead.push(id);
+                        }
+                    }
+                }
+
+                // 刚判 dead 的代理 → 把它上面绑定的号按 region 换绑
+                for dead_id in newly_dead {
+                    let bound = self.token_manager.credentials_bound_to_proxy(dead_id);
+                    if bound.is_empty() {
+                        tracing::warn!("代理 #{} 判定 dead(无绑定号)", dead_id);
+                        continue;
+                    }
+                    tracing::warn!(
+                        "代理 #{} 判定 dead, 尝试为 {} 个绑定号换绑",
+                        dead_id,
+                        bound.len()
+                    );
+                    // 复用 auto_assign：强制重分这些号(reassign_bound=true)
+                    let resp = self.auto_assign_proxies(ProxyAutoAssignRequest {
+                        credential_ids: bound,
+                        reassign_bound: true,
+                    });
+                    tracing::info!(
+                        "死代理 #{} 换绑结果: 成功 {}, 无可用代理 {}",
+                        dead_id,
+                        resp.assigned.len(),
+                        resp.skipped.len()
+                    );
+                }
+            }
+        });
+    }
+
     ///
     /// - 用 `Semaphore(concurrency)` 限并发；每个成功项写回两层 cache 并同步运行时调度器
     /// - 余额低于 `LOW_BALANCE_THRESHOLD` 自动禁用
