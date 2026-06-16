@@ -1876,6 +1876,26 @@ impl MultiTokenManager {
         self.proxy_manager.read().clone()
     }
 
+    /// 把代理池里该号绑定的代理回填进 credentials 副本(proxy_url/账密)。
+    ///
+    /// 号通过 `proxy_id` 引用式绑定代理,真实 url 不落在 entries 副本里(见 acquire_context
+    /// 注释)。对话路径在 `acquire_context` 里回填;而后台只读/管理路径(查模型、查额度、
+    /// 超额开关、手动刷新等)各自从 entries 读副本,若不回填会直连上游 —— 墙内失败、且泄露
+    /// 服务器真实 IP。这些路径低频,无需占代理并发 permit,只回填 url 让 effective_proxy 命中。
+    ///
+    /// 代理池未注入、号未绑 proxy_id、或绑定的代理已被删 → 不改动,降级走凭据自身 proxy_url/全局。
+    fn backfill_pool_proxy(&self, credentials: &mut KiroCredentials) {
+        if let Some(pid) = credentials.proxy_id {
+            if let Some(pm) = self.proxy_manager() {
+                if let Some(entry) = pm.get(pid) {
+                    credentials.proxy_url = Some(entry.url);
+                    credentials.proxy_username = entry.username;
+                    credentials.proxy_password = entry.password;
+                }
+            }
+        }
+    }
+
     /// 应用 meteringEvent 上报的 credit 消耗：从运行时余额缓存扣减
     ///
     /// 仅对已初始化的缓存生效（未查过余额的凭据先不扣，避免基于 0 反而把 remaining 拉负）。
@@ -2905,7 +2925,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -2913,6 +2933,8 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+        // 回填代理池绑定的代理,否则查额度直连上游(墙内失败 / 泄露真实 IP)
+        self.backfill_pool_proxy(&mut credentials);
 
         let proxy_snap = self.proxy.read().clone();
         let config_snap = self.config.read().clone();
@@ -3072,7 +3094,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3080,6 +3102,8 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+        // 回填代理池绑定的代理,否则查模型列表直连上游(墙内失败 / 泄露真实 IP)
+        self.backfill_pool_proxy(&mut credentials);
         let proxy_snap = self.proxy.read().clone();
         let config_snap = self.config.read().clone();
         let effective_proxy = credentials.effective_proxy(proxy_snap.as_ref());
@@ -3163,7 +3187,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3171,6 +3195,8 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+        // 回填代理池绑定的代理,否则改超额开关直连上游(墙内失败 / 泄露真实 IP)
+        self.backfill_pool_proxy(&mut credentials);
 
         let proxy_snap = self.proxy.read().clone();
         let config_snap = self.config.read().clone();
@@ -3322,8 +3348,11 @@ impl MultiTokenManager {
         } else {
             let proxy_snap = self.proxy.read().clone();
             let config_snap = self.config.read().clone();
-            let effective_proxy = new_cred.effective_proxy(proxy_snap.as_ref());
-            match refresh_token(&new_cred, &config_snap, effective_proxy.as_ref()).await {
+            // 若导入的号已带 proxy_id,回填代理池代理后再首刷验证(否则验证直连上游)
+            let mut probe_cred = new_cred.clone();
+            self.backfill_pool_proxy(&mut probe_cred);
+            let effective_proxy = probe_cred.effective_proxy(proxy_snap.as_ref());
+            match refresh_token(&probe_cred, &config_snap, effective_proxy.as_ref()).await {
                 Ok(refreshed) => (refreshed, false),
                 Err(e) => {
                     if validate {
@@ -3561,7 +3590,7 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3569,6 +3598,8 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+        // 回填代理池绑定的代理,否则强制刷新直连上游(墙内失败 / 泄露真实 IP)
+        self.backfill_pool_proxy(&mut credentials);
 
         // 同凭据串行，多凭据并行
         let lock = self.refresh_lock_for(id);
@@ -3781,7 +3812,7 @@ impl MultiTokenManager {
     ///
     /// 如果刷新失败但现有 Token 仍未过期，返回 fallback 结果继续使用现有 Token。
     pub async fn refresh_token_for_credential(&self, id: u64) -> anyhow::Result<RefreshResult> {
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3795,6 +3826,8 @@ impl MultiTokenManager {
             let expires_at = credentials.expires_at.unwrap_or_default();
             return Ok(RefreshResult::success(id, expires_at));
         }
+        // 回填代理池绑定的代理,否则刷新直连上游(墙内失败 / 泄露真实 IP)
+        self.backfill_pool_proxy(&mut credentials);
 
         let lock = self.refresh_lock_for(id);
         let _guard = lock.lock().await;
