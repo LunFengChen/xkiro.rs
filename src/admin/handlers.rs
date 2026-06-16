@@ -455,7 +455,7 @@ pub async fn import_proxies(
     State(state): State<AdminState>,
     Json(payload): Json<ProxyImportRequest>,
 ) -> impl IntoResponse {
-    Json(state.service.import_proxies(payload))
+    Json(state.service.import_proxies(payload).await)
 }
 
 /// POST /api/admin/proxies/auto-assign — 按 region 自动分配代理给号

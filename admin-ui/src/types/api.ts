@@ -322,6 +322,8 @@ export interface ProxyItem {
   url: string
   username?: string | null
   region?: string | null
+  /** 出口所在国家（ipinfo 探测回填，如 US） */
+  country?: string | null
   maxConcurrency: number
   disabled: boolean
   note?: string | null

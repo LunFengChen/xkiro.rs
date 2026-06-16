@@ -45,6 +45,10 @@ pub struct ProxyEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
+    /// 该代理出口所在国家(如 US,由 ipinfo.io 探测回填,仅展示用)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+
     /// 每代理并发上限。None 或 0 视为不限(不建信号量,调度时直接放行)
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +335,31 @@ impl ProxyManager {
                 anyhow::bail!("代理 #{} 不存在", id);
             }
             self.semaphores.lock().remove(&id);
+        }
+        self.persist()?;
+        Ok(())
+    }
+
+    /// 回填代理出口地理信息(region/country,由 ipinfo 探测得到)。
+    /// 仅更新这两个展示字段,不动 url/账密/并发/健康状态。代理不存在则忽略。
+    pub fn set_geo(
+        &self,
+        id: u64,
+        region: Option<String>,
+        country: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut states = self.states.lock();
+            let state = states
+                .iter_mut()
+                .find(|s| s.entry.id == Some(id))
+                .ok_or_else(|| anyhow::anyhow!("代理 #{} 不存在", id))?;
+            if region.is_some() {
+                state.entry.region = region;
+            }
+            if country.is_some() {
+                state.entry.country = country;
+            }
         }
         self.persist()?;
         Ok(())

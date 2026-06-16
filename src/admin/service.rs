@@ -816,6 +816,15 @@ impl AdminService {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
+        // 导入即默认开启超额(overage)。失败不影响凭据添加(用户可后续手动开)。
+        if let Err(e) = self
+            .token_manager
+            .set_overage_status_for(credential_id, true)
+            .await
+        {
+            tracing::warn!("凭据 #{} 添加后默认开启超额失败(不影响添加): {}", credential_id, e);
+        }
+
         Ok(AddCredentialResponse {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
@@ -2269,6 +2278,17 @@ impl AdminService {
                 // validate=false：首刷失败也会入池为禁用态，交给后台定时重试。
                 // 这里据实告知用户该号是「已激活」还是「已入池待自动重试」。
                 let pending_retry = self.token_manager.is_credential_disabled(credential_id);
+                // 导入即默认开启超额(overage)。仅对激活成功的号尝试;失败不影响导入结果
+                // (上游开关失败时号照常可用,用户可后续手动开)。禁用态的号留给后台重试激活后再说。
+                if !pending_retry {
+                    if let Err(e) = self
+                        .token_manager
+                        .set_overage_status_for(credential_id, true)
+                        .await
+                    {
+                        tracing::warn!("凭据 #{} 导入后默认开启超额失败(不影响导入): {}", credential_id, e);
+                    }
+                }
                 ImportItemResult {
                     index,
                     fingerprint,
@@ -2353,6 +2373,7 @@ impl AdminService {
                     "url": v.entry.url,
                     "username": v.entry.username,
                     "region": v.entry.region,
+                    "country": v.entry.country,
                     "maxConcurrency": v.entry.max_concurrency,
                     "disabled": v.entry.disabled,
                     "note": v.entry.note,
@@ -2440,42 +2461,66 @@ impl AdminService {
     }
 
     /// 批量导入代理:每行 `url` 或 `url,user,pass`,以 `#` 开头或空行跳过
-    pub fn import_proxies(&self, req: ProxyImportRequest) -> ProxyImportResponse {
+    /// 批量导入代理。每行支持两种格式(自动识别):
+    ///   - `ip:port:username:password` 或 `ip:port`(冒号分隔,默认 socks5://)
+    ///   - `url[,username[,password]]`(逗号分隔,url 自带 scheme)
+    /// 导入后逐个经代理探测 ipinfo.io/json 回填 region/country(失败不影响导入)。
+    /// `#` 开头或空行跳过。
+    pub async fn import_proxies(&self, req: ProxyImportRequest) -> ProxyImportResponse {
         let mut added = 0usize;
         let mut failed = 0usize;
         let mut errors = Vec::new();
+        let mut new_ids: Vec<u64> = Vec::new();
         for (lineno, raw) in req.text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-            let url = parts[0].to_string();
-            if url.is_empty() {
-                failed += 1;
-                errors.push(format!("第{}行: url 为空", lineno + 1));
-                continue;
-            }
-            let username = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
-            let password = parts.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let (url, username, password) = match parse_proxy_line(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    failed += 1;
+                    errors.push(format!("第{}行: {}", lineno + 1, e));
+                    continue;
+                }
+            };
             let entry = crate::kiro::proxy_manager::ProxyEntry {
                 id: None,
                 url,
                 username,
                 password,
                 region: req.region.clone(),
+                country: None,
                 max_concurrency: req.max_concurrency,
                 disabled: false,
                 note: None,
             };
             match self.proxy_manager.add(entry) {
-                Ok(_) => added += 1,
+                Ok(id) => {
+                    added += 1;
+                    new_ids.push(id);
+                }
                 Err(e) => {
                     failed += 1;
                     errors.push(format!("第{}行: {}", lineno + 1, e));
                 }
             }
         }
+
+        // 导入完成后,逐个经代理探测出口地理(region/country)。这步是 best-effort:
+        // 探测失败仅跳过该条的 geo 回填,不计入 failed、不影响导入结果。
+        for id in new_ids {
+            if let Some(entry) = self.proxy_manager.get(id) {
+                if let Some(geo) = probe_proxy_geo(&entry).await {
+                    // 行内/批量已显式指定 region 时,不用 ipinfo 覆盖;country 始终回填
+                    let region = if entry.region.is_some() { None } else { geo.region };
+                    if let Err(e) = self.proxy_manager.set_geo(id, region, geo.country) {
+                        tracing::warn!("代理 #{} 回填地理信息失败: {}", id, e);
+                    }
+                }
+            }
+        }
+
         ProxyImportResponse {
             added,
             failed,
@@ -2554,6 +2599,7 @@ impl AdminService {
             username: req.username,
             password: req.password,
             region: req.region,
+            country: None,
             max_concurrency: req.max_concurrency,
             disabled: req.disabled,
             note: req.note,
@@ -2608,6 +2654,83 @@ impl AdminService {
             },
         }
     }
+}
+
+/// ipinfo.io/json 探测到的出口地理信息(仅取关心的两个字段)
+struct ProxyGeo {
+    region: Option<String>,
+    country: Option<String>,
+}
+
+/// 解析一行代理文本,返回 (url, username, password)。支持两种格式:
+///   1. 冒号分隔 `ip:port[:user:pass]` —— 无 scheme,默认补 `socks5://`
+///   2. 逗号分隔 `url[,user[,pass]]` —— url 自带 scheme(http/https/socks5(h))
+/// 识别规则:含 `://` 或含 `,` → 走逗号格式;否则按冒号格式拆。
+fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String>), String> {
+    let line = line.trim();
+    // 逗号格式(原有):显式 url[,user[,pass]]
+    if line.contains("://") || line.contains(',') {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        let url = parts[0].to_string();
+        if url.is_empty() {
+            return Err("url 为空".to_string());
+        }
+        let username = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        let password = parts.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        return Ok((url, username, password));
+    }
+    // 冒号格式:ip:port 或 ip:port:user:pass,默认 socks5://
+    let parts: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
+    match parts.as_slice() {
+        [ip, port] => {
+            if ip.is_empty() || port.is_empty() {
+                return Err(format!("冒号格式需 ip:port,得到: {}", line));
+            }
+            Ok((format!("socks5://{}:{}", ip, port), None, None))
+        }
+        [ip, port, user, pass] => {
+            if ip.is_empty() || port.is_empty() {
+                return Err(format!("冒号格式需 ip:port:user:pass,得到: {}", line));
+            }
+            let username = (!user.is_empty()).then(|| user.to_string());
+            let password = (!pass.is_empty()).then(|| pass.to_string());
+            Ok((format!("socks5://{}:{}", ip, port), username, password))
+        }
+        _ => Err(format!(
+            "无法识别的代理格式(支持 ip:port[:user:pass] 或 url[,user,pass]): {}",
+            line
+        )),
+    }
+}
+
+/// 经代理请求 ipinfo.io/json,拿出口的 region/country。失败返回 None(best-effort)。
+async fn probe_proxy_geo(entry: &crate::kiro::proxy_manager::ProxyEntry) -> Option<ProxyGeo> {
+    let proxy_cfg = entry.to_proxy_config();
+    let client = crate::http_client::build_client(
+        Some(&proxy_cfg),
+        10,
+        crate::model::config::TlsBackend::Rustls,
+    )
+    .ok()?;
+    let resp = client.get("https://ipinfo.io/json").send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let region = json
+        .get("region")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let country = json
+        .get("country")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if region.is_none() && country.is_none() {
+        return None;
+    }
+    Some(ProxyGeo { region, country })
 }
 
 use crate::kiro::token_manager::CreditUsageObserver;

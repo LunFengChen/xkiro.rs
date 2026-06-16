@@ -288,7 +288,11 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
                       )}
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-muted-foreground">
-                      {p.region && <span>区域 {p.region}</span>}
+                      {(p.region || p.country) && (
+                        <span>
+                          出口 {[p.region, p.country].filter(Boolean).join(', ')}
+                        </span>
+                      )}
                       <span>绑定 {p.boundCredentials} 号</span>
                       <span>并发 {p.maxConcurrency}</span>
                       <span>可用 {p.availablePermits}</span>
@@ -464,13 +468,14 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
         <div className="space-y-2 rounded-md border bg-background p-3">
           <h3 className="text-sm font-medium">批量导入</h3>
           <p className="text-2xs text-muted-foreground">
-            每行一个，格式 <code>url</code> 或 <code>url,user,pass</code>
+            每行一个，支持 <code>ip:port:user:pass</code>（默认 socks5）或{' '}
+            <code>url</code> / <code>url,user,pass</code>。导入后自动探测出口区域/国家。
           </p>
           <textarea
             value={importText}
             onChange={(e) => setImportText(e.target.value)}
             rows={5}
-            placeholder={'http://1.2.3.4:8080\nhttp://5.6.7.8:8080,user,pass'}
+            placeholder={'38.111.61.59:443:user:pass\nsocks5://1.2.3.4:1080\nhttp://5.6.7.8:8080,user,pass'}
             className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
           />
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
