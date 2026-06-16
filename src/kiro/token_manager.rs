@@ -557,6 +557,9 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 引用式绑定的代理池条目 ID（用于前端展示绑定关系）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -656,6 +659,9 @@ pub struct MultiTokenManager {
     credit_observer: Mutex<Option<std::sync::Weak<dyn CreditUsageObserver>>>,
     /// Session 亲和性：让同一会话连续请求黏住同一凭据（提升上游 prompt cache 命中率）
     session_affinity: SessionAffinity,
+    /// 代理池(引用式绑定)。号的 proxy_id 在 acquire_context 里查此池得到真实 url。
+    /// 用 RwLock<Option<Arc>> 因 ProxyManager 可能晚于 token_manager 构造,启动后 set 注入。
+    proxy_manager: RwLock<Option<Arc<crate::kiro::proxy_manager::ProxyManager>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -748,6 +754,8 @@ pub struct CallContext {
     pub(crate) _credential_permit: Option<OwnedSemaphorePermit>,
     /// 全局并发 permit（Drop 时归还全局信号量配额；None = 未启用全局限流）
     pub(crate) _global_permit: Option<OwnedSemaphorePermit>,
+    /// 代理并发 permit（Drop 时归还该代理信号量配额；None = 未绑代理或代理不限并发）
+    pub(crate) _proxy_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Credit usage 观察者：每次 meteringEvent 命中后回调
@@ -919,6 +927,7 @@ impl MultiTokenManager {
             global_semaphore: Mutex::new(global_semaphore),
             credit_observer: Mutex::new(None),
             session_affinity: SessionAffinity::default(),
+            proxy_manager: RwLock::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1443,7 +1452,7 @@ impl MultiTokenManager {
                     .find(|e| e.id == id && !e.disabled)
                     .map(|e| e.credentials.clone())
             };
-            let credentials = match credentials {
+            let mut credentials = match credentials {
                 Some(c) => c,
                 None => {
                     // 等待期间凭据被禁用 → 释放 permit 重新选择
@@ -1451,6 +1460,54 @@ impl MultiTokenManager {
                     attempt_count += 1;
                     continue;
                 }
+            };
+
+            // 4.5 引用式代理注入(若号绑定了代理池条目)
+            //     - 代理不可用(dead/disabled/不存在)→ 该号本轮跳过,等巡检换绑(防止用死代理发请求误禁号)
+            //     - 代理有并发上限且已满 → fallback 到下个候选号/region
+            //     - 否则:占用代理 permit + 把真实 url/账密回填进 credentials 副本
+            let proxy_permit: Option<OwnedSemaphorePermit> = if let Some(pid) =
+                credentials.proxy_id
+            {
+                if let Some(pm) = self.proxy_manager() {
+                    if !pm.is_usable(pid) {
+                        // 绑定的代理已 dead/禁用 → 本轮跳过该号(不发请求、不禁号)
+                        tracing::debug!("凭据 #{} 绑定代理 #{} 不可用,本轮跳过", id, pid);
+                        drop(per_cred_permit);
+                        attempt_count += 1;
+                        continue;
+                    }
+                    // 占用代理并发 permit(若该代理设了上限)
+                    let permit = if let Some(sem) = pm.semaphore_for(pid) {
+                        match sem.try_acquire_owned() {
+                            Ok(p) => Some(p),
+                            Err(_) => {
+                                // 代理并发已满 → fallback 到下个候选(其他号/region)
+                                tracing::debug!(
+                                    "代理 #{} 并发已满,凭据 #{} 本轮跳过",
+                                    pid,
+                                    id
+                                );
+                                drop(per_cred_permit);
+                                attempt_count += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        None // 该代理不限并发
+                    };
+                    // 回填真实代理到 credentials 副本(provider 照旧读 proxy_url 命中缓存)
+                    if let Some(entry) = pm.get(pid) {
+                        credentials.proxy_url = Some(entry.url);
+                        credentials.proxy_username = entry.username;
+                        credentials.proxy_password = entry.password;
+                    }
+                    permit
+                } else {
+                    None // 代理池未注入,忽略 proxy_id(降级走凭据自身 proxy_url/全局)
+                }
+            } else {
+                None
             };
 
             // 5. 获取 global permit（如配置了 global_concurrency > 0）
@@ -1471,14 +1528,21 @@ impl MultiTokenManager {
             // 6. 尝试获取/刷新 Token，并把 permit 注入 CallContext（Drop 自动归还）
             match self.try_ensure_token(id, &credentials).await {
                 Ok(mut ctx) => {
+                    // 把回填的代理字段补到 ctx.credentials(只覆盖代理三件套,保留刷新后的 token)
+                    // 这样 provider.client_for 走绑定的代理出口
+                    ctx.credentials.proxy_url = credentials.proxy_url.clone();
+                    ctx.credentials.proxy_username = credentials.proxy_username.clone();
+                    ctx.credentials.proxy_password = credentials.proxy_password.clone();
                     ctx._credential_permit = Some(per_cred_permit);
                     ctx._global_permit = global_permit;
+                    ctx._proxy_permit = proxy_permit;
                     return Ok(ctx);
                 }
                 Err(e) => {
                     // 早 drop：刷新失败时尽快归还 permit，避免占用排队席位
                     drop(per_cred_permit);
                     drop(global_permit);
+                    drop(proxy_permit);
 
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
@@ -1799,6 +1863,19 @@ impl MultiTokenManager {
         *self.credit_observer.lock() = Some(observer);
     }
 
+    /// 注入代理池(启动后由 main.rs 调用)。引用式绑定的运行时依赖。
+    pub fn set_proxy_manager(
+        &self,
+        pm: Arc<crate::kiro::proxy_manager::ProxyManager>,
+    ) {
+        *self.proxy_manager.write() = Some(pm);
+    }
+
+    /// 取代理池引用(克隆 Arc)
+    fn proxy_manager(&self) -> Option<Arc<crate::kiro::proxy_manager::ProxyManager>> {
+        self.proxy_manager.read().clone()
+    }
+
     /// 应用 meteringEvent 上报的 credit 消耗：从运行时余额缓存扣减
     ///
     /// 仅对已初始化的缓存生效（未查过余额的凭据先不扣，避免基于 0 反而把 remaining 拉负）。
@@ -1923,6 +2000,7 @@ impl MultiTokenManager {
                 token,
                 _credential_permit: None,
                 _global_permit: None,
+                _proxy_permit: None,
             });
         }
 
@@ -1935,7 +2013,7 @@ impl MultiTokenManager {
             let _guard = lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
-            let current_creds = {
+            let mut current_creds = {
                 let entries = self.entries.lock();
                 entries
                     .iter()
@@ -1943,6 +2021,11 @@ impl MultiTokenManager {
                     .map(|e| e.credentials.clone())
                     .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
             };
+            // 把调用方注入的引用式代理同步到 current_creds,确保刷新请求也走绑定代理出口
+            // (避免 token 刷新时泄露真实 IP)。entries 里的持久副本不含 proxy_id 回填的 url。
+            current_creds.proxy_url = credentials.proxy_url.clone();
+            current_creds.proxy_username = credentials.proxy_username.clone();
+            current_creds.proxy_password = credentials.proxy_password.clone();
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
@@ -1997,6 +2080,7 @@ impl MultiTokenManager {
             token,
             _credential_permit: None,
             _global_permit: None,
+            _proxy_permit: None,
         })
     }
 
@@ -2438,6 +2522,7 @@ impl MultiTokenManager {
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    proxy_id: e.credentials.proxy_id,
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| match r {
                         DisabledReason::Manual => "Manual",
@@ -4679,6 +4764,137 @@ mod tests {
             assert_eq!(
                 entry_after.priority, priority_before,
                 "持久化失败后 in-memory priority 不应被改动"
+            );
+        }
+    }
+
+    // ============================================================
+    // 引用式代理绑定 + 调度接入测试（阶段B）
+    // ============================================================
+    mod proxy_binding_tests {
+        use super::super::*;
+        use crate::kiro::proxy_manager::{ProxyEntry, ProxyManager, PROXY_DEAD_THRESHOLD};
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+        use tokio::time::timeout as tokio_timeout;
+
+        fn make_cred(tag: &str) -> KiroCredentials {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some(format!("refresh-{}-{}", tag, "x".repeat(120)));
+            c.access_token = Some(format!("token-{}", tag));
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c
+        }
+
+        fn make_config(per_cred: usize, timeout_secs: u64) -> Config {
+            let mut config = Config::default();
+            config.per_credential_concurrency = per_cred;
+            config.acquire_wait_timeout_secs = timeout_secs;
+            config
+        }
+
+        fn proxy(url: &str, max_c: Option<u32>) -> ProxyEntry {
+            ProxyEntry {
+                url: url.to_string(),
+                max_concurrency: max_c,
+                ..Default::default()
+            }
+        }
+
+        /// 绑定的代理被回填进 ctx.credentials.proxy_url
+        #[tokio::test]
+        async fn bound_proxy_url_injected_into_context() {
+            let pm = Arc::new(ProxyManager::new(vec![proxy("http://p1:8080", None)], None).unwrap());
+            let pid = pm.list()[0].entry.id.unwrap();
+
+            let mut cred = make_cred("a");
+            cred.proxy_id = Some(pid);
+            let manager =
+                MultiTokenManager::new(make_config(2, 5), vec![cred], None, None, false).unwrap();
+            manager.set_proxy_manager(Arc::clone(&pm));
+
+            let ctx = manager.acquire_context(None).await.unwrap();
+            assert_eq!(
+                ctx.credentials.proxy_url.as_deref(),
+                Some("http://p1:8080"),
+                "绑定代理的 url 应回填进 ctx.credentials"
+            );
+        }
+
+        /// 绑定的代理 dead → 该号本轮被跳过(无可用候选时整体失败,不误禁号)
+        #[tokio::test]
+        async fn dead_proxy_skips_credential() {
+            let pm = Arc::new(ProxyManager::new(vec![proxy("http://dead:8080", None)], None).unwrap());
+            let pid = pm.list()[0].entry.id.unwrap();
+            // 连续失败打到阈值 → dead
+            for _ in 0..PROXY_DEAD_THRESHOLD {
+                pm.record_health(pid, false, Some("conn refused".into()));
+            }
+            assert!(!pm.is_usable(pid), "代理应已 dead");
+
+            let mut cred = make_cred("a");
+            cred.proxy_id = Some(pid);
+            let manager =
+                MultiTokenManager::new(make_config(2, 1), vec![cred], None, None, false).unwrap();
+            manager.set_proxy_manager(Arc::clone(&pm));
+
+            // 唯一号绑死代理 → 无候选,应超时失败而不是用死代理发请求
+            let r = tokio_timeout(StdDuration::from_secs(3), manager.acquire_context(None)).await;
+            match r {
+                Ok(inner) => assert!(inner.is_err(), "绑死代理的唯一号不应拿到 ctx"),
+                Err(_) => {} // 等待超时也算预期(没有任何候选)
+            }
+        }
+
+        /// 代理并发上限=1,两个号共享同一代理:第二个号 fallback,直到 permit 释放
+        #[tokio::test]
+        async fn shared_proxy_semaphore_limits_concurrency() {
+            let pm = Arc::new(
+                ProxyManager::new(vec![proxy("http://shared:8080", Some(1))], None).unwrap(),
+            );
+            let pid = pm.list()[0].entry.id.unwrap();
+
+            let mut a = make_cred("a");
+            a.proxy_id = Some(pid);
+            let mut b = make_cred("b");
+            b.proxy_id = Some(pid);
+            let manager = Arc::new(
+                MultiTokenManager::new(make_config(4, 1), vec![a, b], None, None, false).unwrap(),
+            );
+            manager.set_proxy_manager(Arc::clone(&pm));
+
+            // 第一个号占用代理唯一 permit
+            let ctx1 = manager.acquire_context(None).await.unwrap();
+
+            // 第二个号:代理满 → 两个号都因代理满而 fallback,无候选 → 超时
+            let r = tokio_timeout(StdDuration::from_secs(2), manager.acquire_context(None)).await;
+            assert!(
+                r.is_err() || r.unwrap().is_err(),
+                "代理并发已满时第二个号不应拿到 ctx"
+            );
+
+            // 释放第一个 → 代理 permit 归还,再取应成功
+            drop(ctx1);
+            let ctx2 = tokio_timeout(StdDuration::from_secs(2), manager.acquire_context(None))
+                .await
+                .expect("代理 permit 释放后应能取到")
+                .expect("acquire 应成功");
+            assert_eq!(ctx2.credentials.proxy_url.as_deref(), Some("http://shared:8080"));
+        }
+
+        /// 未注入代理池时,proxy_id 被忽略(降级,不影响调度)
+        #[tokio::test]
+        async fn missing_proxy_manager_ignores_binding() {
+            let mut cred = make_cred("a");
+            cred.proxy_id = Some(999);
+            let manager =
+                MultiTokenManager::new(make_config(2, 5), vec![cred], None, None, false).unwrap();
+            // 不调用 set_proxy_manager
+
+            let ctx = manager.acquire_context(None).await.unwrap();
+            assert!(
+                ctx.credentials.proxy_url.is_none(),
+                "无代理池时 proxy_id 应被忽略,不回填 url"
             );
         }
     }

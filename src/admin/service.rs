@@ -384,6 +384,7 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_id: entry.proxy_id,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -719,6 +720,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_id: req.proxy_id,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -2180,6 +2182,7 @@ impl AdminService {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             concurrency: None,
         };

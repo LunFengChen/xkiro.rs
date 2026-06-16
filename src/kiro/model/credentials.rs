@@ -101,6 +101,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 引用式绑定的代理池条目 ID（可选）
+    ///
+    /// 设置后,运行时由 token_manager 在 acquire_context 里按此 id 从 ProxyManager
+    /// 查出真实代理 url/账密,临时回填进 credentials 副本的 proxy_url 字段。
+    /// 老 credentials.json 无此字段 → 反序列化为 None,行为与现状一致(走 proxy_url/全局)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -362,6 +370,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -481,6 +490,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -513,6 +523,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -628,6 +639,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
