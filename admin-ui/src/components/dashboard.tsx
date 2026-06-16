@@ -19,7 +19,7 @@ import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
-import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam } from '@/api/credentials'
+import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam, deleteCredentialsBatch } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
@@ -53,6 +53,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
+  const [compactMode, setCompactMode] = useState(() => {
+    try { return localStorage.getItem('kiro-compact-mode') === '1' } catch { return false }
+  })
   const [darkMode, setDarkMode] = useState(() => {
     const saved = storage.getTheme()
     if (saved) {
@@ -88,10 +91,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   })
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
-  const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
-    return Boolean(credential?.disabled)
-  }).length
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -259,61 +258,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedIds(new Set())
   }
 
-  // 批量删除（仅删除已禁用项）
+  // 批量删除（任意状态可删）
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) {
       toast.error('请先选择要删除的凭据')
       return
     }
 
-    const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.disabled)
-    })
-
-    if (disabledIds.length === 0) {
-      toast.error('选中的凭据中没有已禁用项')
+    const ids = Array.from(selectedIds)
+    if (!confirm(`确定要删除选中的 ${ids.length} 个凭据吗？此操作无法撤销（系统每 6 小时自动备份）。`)) {
       return
     }
 
-    const skippedCount = selectedIds.size - disabledIds.length
-    const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
-
-    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
-      return
-    }
-
-    let successCount = 0
-    let failCount = 0
-
-    for (const id of disabledIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
+    try {
+      const res = await deleteCredentialsBatch(ids)
+      if (res.failureCount === 0) {
+        toast.success(`成功删除 ${res.successCount} 个凭据`)
+      } else {
+        toast.warning(`删除：成功 ${res.successCount}，失败 ${res.failureCount}`)
       }
-    }
-
-    const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
-
-    if (failCount === 0) {
-      toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
-    } else {
-      toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
+    } catch (err) {
+      toast.error(`批量删除失败: ${extractErrorMessage(err)}`)
     }
 
     deselectAll()
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
   }
 
   // 批量恢复异常
@@ -869,8 +838,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="destructive"
                   className="h-8"
-                  disabled={selectedDisabledCount === 0}
-                  title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
+                  disabled={selectedIds.size === 0}
+                  title={`删除选中的 ${selectedIds.size} 个凭据（任意状态）`}
                 >
                   <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   批量删除
@@ -917,6 +886,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <Upload className="h-3.5 w-3.5 mr-1.5" />
               批量导入
             </Button>
+            <Button
+              variant={compactMode ? 'default' : 'outline'}
+              size="sm"
+              className="h-8"
+              onClick={() => {
+                const next = !compactMode
+                setCompactMode(next)
+                try { localStorage.setItem('kiro-compact-mode', next ? '1' : '0') } catch {}
+              }}
+              title={compactMode ? '切换到详细视图' : '切换到紧凑视图'}
+            >
+              {compactMode ? '详细' : '紧凑'}
+            </Button>
             <Button onClick={() => setAddDialogOpen(true)} size="sm" className="h-8">
               <Plus className="h-3.5 w-3.5 mr-1.5" />
               添加凭据
@@ -933,28 +915,88 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </Card>
         ) : (
           <>
-            <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6">
-              {currentCredentials.map((credential) => (
-                <CredentialCard
-                  key={credential.id}
-                  credential={credential}
-                  onViewBalance={handleViewBalance}
-                  onViewModels={handleViewModels}
-                  selected={selectedIds.has(credential.id)}
-                  onToggleSelect={() => toggleSelect(credential.id)}
-                  balance={balanceMap.get(credential.id) || null}
-                  loadingBalance={loadingBalanceIds.has(credential.id)}
-                  onBalanceChange={(id, next) => {
-                    setBalanceMap(prev => {
-                      const m = new Map(prev)
-                      if (next) m.set(id, next)
-                      else m.delete(id)
-                      return m
-                    })
-                  }}
-                />
-              ))}
-            </div>
+            {compactMode ? (
+              /* 紧凑视图：每号一行，仅显示标题 + 双进度条 */
+              <div className="flex flex-col gap-1">
+                {currentCredentials.map((credential) => {
+                  const bal = balanceMap.get(credential.id) || null
+                  const limit = bal?.usageLimit ?? 0
+                  const used = bal?.currentUsage ?? 0
+                  const baseRemaining = Math.max(0, limit - used)
+                  const basePercent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
+                  const overCap = bal?.overageCap ?? 0
+                  const overUsed = Math.max(0, used - limit)
+                  const overRemaining = Math.max(0, overCap - overUsed)
+                  const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
+                  const disabled = credential.disabled
+                  const label = credential.email
+                    ? credential.email.split('@')[0]
+                    : `#${credential.id}`
+                  return (
+                    <div
+                      key={credential.id}
+                      className={`flex items-center gap-2 px-2 py-1 rounded border text-xs ${disabled ? 'opacity-50' : ''} ${selectedIds.has(credential.id) ? 'border-primary bg-primary/5' : 'border-border'}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(credential.id)}
+                        onChange={() => toggleSelect(credential.id)}
+                        className="h-3.5 w-3.5 shrink-0 cursor-pointer"
+                      />
+                      <span className="w-28 shrink-0 truncate font-mono text-muted-foreground" title={credential.email || String(credential.id)}>
+                        {label}
+                      </span>
+                      <div className="flex-1 flex flex-col gap-0.5">
+                        <div className="flex items-center gap-1">
+                          <span className="w-8 text-right tabular-nums text-muted-foreground">{limit > 0 ? Math.round(baseRemaining) : '—'}</span>
+                          <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all ${basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-yellow-500' : 'bg-primary'}`}
+                              style={{ width: `${basePercent}%` }}
+                            />
+                          </div>
+                        </div>
+                        {(overCap > 0 || overUsed > 0) && (
+                          <div className="flex items-center gap-1">
+                            <span className="w-8 text-right tabular-nums text-muted-foreground">{overCap > 0 ? Math.round(overRemaining) : '—'}</span>
+                            <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all ${overPercent >= 90 ? 'bg-destructive' : 'bg-yellow-500'}`}
+                                style={{ width: `${overPercent}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              /* 详细视图：原卡片网格 */
+              <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6">
+                {currentCredentials.map((credential) => (
+                  <CredentialCard
+                    key={credential.id}
+                    credential={credential}
+                    onViewBalance={handleViewBalance}
+                    onViewModels={handleViewModels}
+                    selected={selectedIds.has(credential.id)}
+                    onToggleSelect={() => toggleSelect(credential.id)}
+                    balance={balanceMap.get(credential.id) || null}
+                    loadingBalance={loadingBalanceIds.has(credential.id)}
+                    onBalanceChange={(id, next) => {
+                      setBalanceMap(prev => {
+                        const m = new Map(prev)
+                        if (next) m.set(id, next)
+                        else m.delete(id)
+                        return m
+                      })
+                    }}
+                  />
+                ))}
+              </div>
+            )}
 
             {/* 分页控件 */}
             {totalPages > 1 && (

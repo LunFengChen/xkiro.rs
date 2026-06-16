@@ -7,7 +7,8 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, add_proxy, auto_assign_proxies, delete_credential, delete_proxy,
+        add_credential, add_proxy, auto_assign_proxies, delete_credential,
+        delete_credentials_batch, delete_proxy,
         delete_user_preset, export_kam, export_token_json,
         force_refresh_balances_batch, force_refresh_token, force_refresh_tokens_batch,
         get_all_credentials, get_cached_balances, get_compression_config, get_credential_balance,
@@ -83,6 +84,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/refresh-batch",
             post(force_refresh_tokens_batch),
+        )
+        .route(
+            "/credentials/delete-batch",
+            post(delete_credentials_batch),
         )
         .route(
             "/credentials/refresh-balances-batch",

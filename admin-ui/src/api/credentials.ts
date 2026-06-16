@@ -163,6 +163,23 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
+export interface BatchDeleteResultItem {
+  id: number
+  success: boolean
+  error?: string
+}
+
+export interface BatchDeleteResponse {
+  results: BatchDeleteResultItem[]
+  successCount: number
+  failureCount: number
+}
+
+export async function deleteCredentialsBatch(ids: number[]): Promise<BatchDeleteResponse> {
+  const { data } = await api.post<BatchDeleteResponse>('/credentials/delete-batch', { ids })
+  return data
+}
+
 // 压缩配置类型
 export interface CompressionConfig {
   enabled: boolean

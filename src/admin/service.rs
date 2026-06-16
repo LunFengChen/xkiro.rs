@@ -849,6 +849,42 @@ impl AdminService {
         Ok(())
     }
 
+    /// 批量删除凭据(任意状态均可删)。逐个删除,单条失败不影响其余,汇总结果。
+    pub fn delete_credentials_batch(
+        &self,
+        ids: Vec<u64>,
+    ) -> crate::admin::types::BatchDeleteResponse {
+        use crate::admin::types::{BatchDeleteResponse, BatchDeleteResultItem};
+        let mut results = Vec::with_capacity(ids.len());
+        let mut success_count = 0usize;
+        let mut failure_count = 0usize;
+        for id in ids {
+            match self.delete_credential(id) {
+                Ok(_) => {
+                    success_count += 1;
+                    results.push(BatchDeleteResultItem {
+                        id,
+                        success: true,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    failure_count += 1;
+                    results.push(BatchDeleteResultItem {
+                        id,
+                        success: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        BatchDeleteResponse {
+            results,
+            success_count,
+            failure_count,
+        }
+    }
+
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager

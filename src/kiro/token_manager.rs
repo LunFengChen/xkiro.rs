@@ -662,6 +662,8 @@ pub struct MultiTokenManager {
     /// 代理池(引用式绑定)。号的 proxy_id 在 acquire_context 里查此池得到真实 url。
     /// 用 RwLock<Option<Arc>> 因 ProxyManager 可能晚于 token_manager 构造,启动后 set 注入。
     proxy_manager: RwLock<Option<Arc<crate::kiro::proxy_manager::ProxyManager>>>,
+    /// 上次自动备份 credentials.json 的时刻(None 表示从未备份)。后台循环按间隔节流。
+    last_backup_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -670,6 +672,11 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 被禁用凭据自动重试的退避间隔（分钟），第 N 次重试等第 N 个间隔后执行。
 /// attempts >= len() 仍失败则自动删除。
 const RETRY_BACKOFF_MINUTES: [i64; 5] = [10, 30, 60, 180, 360];
+
+/// 自动备份 credentials.json 的最小间隔(分钟)。后台循环每 tick 检查,够久才备份一次。
+const BACKUP_INTERVAL_MINS: i64 = 30;
+/// 保留的备份份数(轮转),超出删最旧的。
+const BACKUP_KEEP: usize = 12;
 
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
@@ -928,6 +935,7 @@ impl MultiTokenManager {
             credit_observer: Mutex::new(None),
             session_affinity: SessionAffinity::default(),
             proxy_manager: RwLock::new(None),
+            last_backup_at: Mutex::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -2184,6 +2192,86 @@ impl MultiTokenManager {
         self.credentials_path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    /// 后台循环调用:距上次备份超过 BACKUP_INTERVAL_HOURS 才备份一次 credentials.json。
+    /// 备份落在 <cache_dir>/backups/credentials-<UTC时间戳>.json,保留最近 BACKUP_KEEP 份。
+    /// 复用与正式持久化相同的快照构造 + 原子写;失败仅 warn,不影响主流程。
+    pub fn maybe_backup_credentials(&self) {
+        // 仅多凭据格式 + 有路径时才备份
+        if !self.is_multiple_format {
+            return;
+        }
+        let now = Utc::now();
+        {
+            let last = self.last_backup_at.lock();
+            if let Some(prev) = *last {
+                if now.signed_duration_since(prev).num_minutes() < BACKUP_INTERVAL_MINS {
+                    return;
+                }
+            }
+        }
+
+        let Some(dir) = self.cache_dir() else {
+            return;
+        };
+        let backup_dir = dir.join("backups");
+        if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+            tracing::warn!("创建备份目录失败 {:?}: {}", backup_dir, e);
+            return;
+        }
+
+        // 构造与 persist_credentials 完全相同口径的快照:保留所有号,
+        // 但 disabled 仅对「手动禁用」置 true(自动禁用不落盘,避免重启误标)。
+        let snapshot: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled_reason == Some(DisabledReason::Manual);
+                    cred
+                })
+                .collect()
+        };
+        let json = match serde_json::to_string_pretty(&snapshot) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("备份序列化凭据失败: {}", e);
+                return;
+            }
+        };
+
+        let stamp = now.format("%Y%m%dT%H%M%SZ");
+        let path = backup_dir.join(format!("credentials-{}.json", stamp));
+        if let Err(e) = crate::common::io::atomic_write_string_secure(&path, &json) {
+            tracing::warn!("写备份失败 {:?}: {}", path, e);
+            return;
+        }
+        *self.last_backup_at.lock() = Some(now);
+        tracing::info!("已备份凭据 ({} 个) → {:?}", snapshot.len(), path);
+
+        // 轮转:按文件名(含时间戳,字典序=时间序)排序,删除最旧的多余份
+        if let Ok(rd) = std::fs::read_dir(&backup_dir) {
+            let mut files: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("credentials-") && n.ends_with(".json"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            files.sort();
+            if files.len() > BACKUP_KEEP {
+                for old in &files[..files.len() - BACKUP_KEEP] {
+                    if let Err(e) = std::fs::remove_file(old) {
+                        tracing::warn!("删除旧备份失败 {:?}: {}", old, e);
+                    }
+                }
+            }
+        }
     }
 
     /// 统计数据文件路径
@@ -3458,11 +3546,7 @@ impl MultiTokenManager {
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
-            // 检查是否已禁用
-            if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
-            }
+            let _ = entry; // 仅校验存在性;允许删除任意状态的凭据(已禁用/启用均可)
 
             // 删除凭据
             entries.retain(|e| e.id != id);
@@ -3583,6 +3667,9 @@ impl MultiTokenManager {
                 }
             }
         }
+
+        // 每次后台 tick 检查是否到了定期备份的时间(has throttle inside)
+        self.maybe_backup_credentials();
     }
 
 

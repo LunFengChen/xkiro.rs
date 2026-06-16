@@ -166,6 +166,15 @@ pub async fn delete_credential(
     }
 }
 
+/// POST /api/admin/credentials/delete-batch
+/// 批量删除凭据(任意状态可删),前端一次往返
+pub async fn delete_credentials_batch(
+    State(state): State<AdminState>,
+    Json(req): Json<BatchRefreshRequest>,
+) -> impl IntoResponse {
+    Json(state.service.delete_credentials_batch(req.ids)).into_response()
+}
+
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
 pub async fn force_refresh_token(

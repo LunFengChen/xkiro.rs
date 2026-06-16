@@ -733,6 +733,25 @@ pub struct BatchRefreshResponse {
     pub failure_count: usize,
 }
 
+/// 批量删除单项结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteResultItem {
+    pub id: u64,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量删除响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteResponse {
+    pub results: Vec<BatchDeleteResultItem>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
 // ============ 批量刷新余额端点 ============
 
 /// 单个凭据的余额刷新结果
