@@ -27,7 +27,9 @@ use super::types::{
     CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
     ImportAction, ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
     PresetItem,
-    ProxyConfigResponse, RuntimeBalanceSnapshot, RuntimeStatsItem, RuntimeStatsResponse,
+    ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse, ProxyImportRequest,
+    ProxyImportResponse, ProxyTestResponse, ProxyUpsertRequest, RuntimeBalanceSnapshot,
+    RuntimeStatsItem, RuntimeStatsResponse,
     SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
     UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
     UpsertUserPresetRequest,
@@ -99,6 +101,8 @@ pub struct AdminService {
     balance_semaphore: Arc<Semaphore>,
     /// 模型列表缓存（仅内存，TTL 30 分钟；按 (id, provider) 区分）
     models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
+    /// 代理池(引用式绑定的运行时来源)。admin 管理 CRUD/测试/分配。
+    proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
 }
 
 impl AdminService {
@@ -110,6 +114,7 @@ impl AdminService {
         prompt_runtime: SharedPromptConfig,
         truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
         known_endpoints: impl IntoIterator<Item = String>,
+        proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -129,6 +134,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             balance_semaphore: Arc::new(Semaphore::new(8)),
             models_cache: Mutex::new(HashMap::new()),
+            proxy_manager,
         }
     }
 
@@ -2257,6 +2263,279 @@ impl AdminService {
 
         // 默认 social
         "social".to_string()
+    }
+
+    // ========================================================
+    // 代理池(引用式绑定)管理
+    // ========================================================
+
+    /// 列出所有代理(含运行时健康 + 可用 permit + 绑定该代理的号数)
+    pub fn list_proxies(&self) -> serde_json::Value {
+        let views = self.proxy_manager.list();
+        let items: Vec<serde_json::Value> = views
+            .into_iter()
+            .map(|v| {
+                let id = v.entry.id.unwrap_or(0);
+                let bound = self.token_manager.credentials_bound_to_proxy(id).len();
+                serde_json::json!({
+                    "id": id,
+                    "url": v.entry.url,
+                    "username": v.entry.username,
+                    "region": v.entry.region,
+                    "maxConcurrency": v.entry.max_concurrency,
+                    "disabled": v.entry.disabled,
+                    "note": v.entry.note,
+                    "dead": v.health.dead,
+                    "consecutiveFailures": v.health.consecutive_failures,
+                    "lastError": v.health.last_error,
+                    "lastChecked": v.health.last_checked,
+                    "availablePermits": v.available_permits,
+                    "boundCredentials": bound,
+                })
+            })
+            .collect();
+        serde_json::json!({ "proxies": items })
+    }
+
+    /// 新增代理
+    pub fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
+        let entry = Self::proxy_entry_from_req(req);
+        self.proxy_manager
+            .add(entry)
+            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))
+    }
+
+    /// 更新代理
+    pub fn update_proxy(&self, id: u64, req: ProxyUpsertRequest) -> Result<(), AdminServiceError> {
+        let entry = Self::proxy_entry_from_req(req);
+        self.proxy_manager
+            .update(id, entry)
+            .map_err(|e| AdminServiceError::InternalError(format!("更新代理失败: {}", e)))
+    }
+
+    /// 删除代理(先解绑所有引用它的号,避免悬空 proxy_id)
+    pub fn delete_proxy(&self, id: u64) -> Result<usize, AdminServiceError> {
+        let bound = self.token_manager.credentials_bound_to_proxy(id);
+        for cid in &bound {
+            // 解绑失败不致命,记录后继续(代理删了,号会降级到无代理)
+            if let Err(e) = self.token_manager.set_proxy_id(*cid, None) {
+                tracing::warn!("删除代理 #{} 时解绑号 #{} 失败: {}", id, cid, e);
+            }
+        }
+        self.proxy_manager
+            .delete(id)
+            .map_err(|e| AdminServiceError::InternalError(format!("删除代理失败: {}", e)))?;
+        Ok(bound.len())
+    }
+
+    /// 给单个号绑定/解绑代理
+    pub fn set_credential_proxy(
+        &self,
+        cred_id: u64,
+        proxy_id: Option<u64>,
+    ) -> Result<(), AdminServiceError> {
+        // 绑定时校验代理存在
+        if let Some(pid) = proxy_id {
+            if self.proxy_manager.get(pid).is_none() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理 #{} 不存在",
+                    pid
+                )));
+            }
+        }
+        self.token_manager
+            .set_proxy_id(cred_id, proxy_id)
+            .map_err(|e| AdminServiceError::InternalError(format!("设置号代理绑定失败: {}", e)))
+    }
+
+    /// 测试单个代理连通性(经代理请求出口 IP 探测端点)
+    pub async fn test_proxy(&self, id: u64) -> ProxyTestResponse {
+        let entry = match self.proxy_manager.get(id) {
+            Some(e) => e,
+            None => {
+                return ProxyTestResponse {
+                    ok: false,
+                    exit_ip: None,
+                    latency_ms: None,
+                    error: Some(format!("代理 #{} 不存在", id)),
+                };
+            }
+        };
+        let result = Self::probe_proxy(&entry).await;
+        // 把测试结果计入健康状态(成功清零失败计数,失败累加→可能判 dead)
+        self.proxy_manager
+            .record_health(id, result.ok, result.error.clone());
+        result
+    }
+
+    /// 批量导入代理:每行 `url` 或 `url,user,pass`,以 `#` 开头或空行跳过
+    pub fn import_proxies(&self, req: ProxyImportRequest) -> ProxyImportResponse {
+        let mut added = 0usize;
+        let mut failed = 0usize;
+        let mut errors = Vec::new();
+        for (lineno, raw) in req.text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let url = parts[0].to_string();
+            if url.is_empty() {
+                failed += 1;
+                errors.push(format!("第{}行: url 为空", lineno + 1));
+                continue;
+            }
+            let username = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let password = parts.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let entry = crate::kiro::proxy_manager::ProxyEntry {
+                id: None,
+                url,
+                username,
+                password,
+                region: req.region.clone(),
+                max_concurrency: req.max_concurrency,
+                disabled: false,
+                note: None,
+            };
+            match self.proxy_manager.add(entry) {
+                Ok(_) => added += 1,
+                Err(e) => {
+                    failed += 1;
+                    errors.push(format!("第{}行: {}", lineno + 1, e));
+                }
+            }
+        }
+        ProxyImportResponse {
+            added,
+            failed,
+            errors,
+        }
+    }
+
+    /// 自动分配:给未绑定(或强制重分)的号按 region 匹配可用代理
+    ///
+    /// 匹配规则:号的 region 与代理 region 相同优先;代理无 region 视为通配兜底。
+    /// 同一 region 内多代理时按"当前绑定数最少"均摊。
+    pub fn auto_assign_proxies(&self, req: ProxyAutoAssignRequest) -> ProxyAutoAssignResponse {
+        let bindings = self.token_manager.credential_region_bindings();
+        // 统计每个代理当前绑定数,用于均摊
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for (_, _, pid, _) in &bindings {
+            if let Some(p) = pid {
+                *load.entry(*p).or_insert(0) += 1;
+            }
+        }
+        let proxies = self.proxy_manager.list();
+
+        let mut assigned = Vec::new();
+        let mut skipped = Vec::new();
+
+        for (cid, region, cur_proxy, disabled) in bindings {
+            // 过滤:指定了 id 列表则只处理列表内;禁用号跳过
+            if !req.credential_ids.is_empty() && !req.credential_ids.contains(&cid) {
+                continue;
+            }
+            if disabled {
+                continue;
+            }
+            // 已绑定且不强制重分 → 跳过(不计入 skipped,本就不需处理)
+            if cur_proxy.is_some() && !req.reassign_bound {
+                continue;
+            }
+
+            // 候选:启用 + 未 dead;region 匹配(相同 region) 或代理无 region(通配)
+            let mut candidates: Vec<u64> = proxies
+                .iter()
+                .filter(|v| !v.entry.disabled && !v.health.dead)
+                .filter(|v| match (&region, &v.entry.region) {
+                    (Some(cr), Some(pr)) => cr == pr,
+                    (_, None) => true, // 代理无 region = 通配兜底
+                    (None, Some(_)) => false, // 号无 region 不配给特定 region 代理
+                })
+                .filter_map(|v| v.entry.id)
+                .collect();
+
+            // 按当前负载升序,均摊分配
+            candidates.sort_by_key(|p| *load.get(p).unwrap_or(&0));
+
+            match candidates.first() {
+                Some(&pid) => {
+                    if let Err(e) = self.token_manager.set_proxy_id(cid, Some(pid)) {
+                        tracing::warn!("自动分配:号 #{} 绑代理 #{} 失败: {}", cid, pid, e);
+                        skipped.push(cid);
+                    } else {
+                        *load.entry(pid).or_insert(0) += 1;
+                        assigned.push((cid, pid));
+                    }
+                }
+                None => skipped.push(cid),
+            }
+        }
+
+        ProxyAutoAssignResponse { assigned, skipped }
+    }
+
+    /// ProxyUpsertRequest → ProxyEntry(id 留空由 manager 分配)
+    fn proxy_entry_from_req(req: ProxyUpsertRequest) -> crate::kiro::proxy_manager::ProxyEntry {
+        crate::kiro::proxy_manager::ProxyEntry {
+            id: None,
+            url: req.url,
+            username: req.username,
+            password: req.password,
+            region: req.region,
+            max_concurrency: req.max_concurrency,
+            disabled: req.disabled,
+            note: req.note,
+        }
+    }
+
+    /// 经代理探测出口 IP(连通性测试)。10s 超时,Rustls 后端。
+    async fn probe_proxy(entry: &crate::kiro::proxy_manager::ProxyEntry) -> ProxyTestResponse {
+        let proxy_cfg = entry.to_proxy_config();
+        let client = match crate::http_client::build_client(
+            Some(&proxy_cfg),
+            10,
+            crate::model::config::TlsBackend::Rustls,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return ProxyTestResponse {
+                    ok: false,
+                    exit_ip: None,
+                    latency_ms: None,
+                    error: Some(format!("构建代理客户端失败: {}", e)),
+                };
+            }
+        };
+
+        let start = std::time::Instant::now();
+        // 用轻量的出口 IP 探测端点
+        let resp = client.get("https://api.ipify.org?format=text").send().await;
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let exit_ip = r.text().await.ok().map(|s| s.trim().to_string());
+                ProxyTestResponse {
+                    ok: true,
+                    exit_ip,
+                    latency_ms: Some(latency_ms),
+                    error: None,
+                }
+            }
+            Ok(r) => ProxyTestResponse {
+                ok: false,
+                exit_ip: None,
+                latency_ms: Some(latency_ms),
+                error: Some(format!("探测端点返回 HTTP {}", r.status())),
+            },
+            Err(e) => ProxyTestResponse {
+                ok: false,
+                exit_ip: None,
+                latency_ms: Some(latency_ms),
+                error: Some(format!("代理连接失败: {}", e)),
+            },
+        }
     }
 }
 

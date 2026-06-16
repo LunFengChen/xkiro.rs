@@ -11,7 +11,8 @@ use super::{
     types::{
         AddCredentialRequest, BatchRefreshRequest, ExportKamRequest, ExportTokenJsonRequest,
         ImportTokenJsonRequest,
-        SetConcurrencyRequest, SetDisabledRequest, SetEndpointRequest, SetOverageRequest,
+        ProxyAutoAssignRequest, ProxyImportRequest, ProxyUpsertRequest, SetConcurrencyRequest,
+        SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetOverageRequest,
         SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
     },
@@ -390,6 +391,95 @@ pub async fn delete_user_preset(
 ) -> impl IntoResponse {
     match state.service.delete_user_preset(&id) {
         Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============================================================
+// 代理池(引用式绑定)管理 handlers
+// ============================================================
+
+/// GET /api/admin/proxies — 列出所有代理(含健康/负载)
+pub async fn list_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_proxies())
+}
+
+/// POST /api/admin/proxies — 新增代理
+pub async fn add_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyUpsertRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy(payload) {
+        Ok(id) => Json(SuccessResponse::new(format!("代理 #{} 已新增", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxies/:id — 更新代理
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ProxyUpsertRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxies/:id — 删除代理(自动解绑引用它的号)
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(id) {
+        Ok(unbound) => Json(SuccessResponse::new(format!(
+            "代理 #{} 已删除(解绑 {} 个号)",
+            id, unbound
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxies/:id/test — 连通性测试
+pub async fn test_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    Json(state.service.test_proxy(id).await)
+}
+
+/// POST /api/admin/proxies/import — 批量导入
+pub async fn import_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyImportRequest>,
+) -> impl IntoResponse {
+    Json(state.service.import_proxies(payload))
+}
+
+/// POST /api/admin/proxies/auto-assign — 按 region 自动分配代理给号
+pub async fn auto_assign_proxies(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyAutoAssignRequest>,
+) -> impl IntoResponse {
+    Json(state.service.auto_assign_proxies(payload))
+}
+
+/// POST /api/admin/credentials/:id/proxy — 给单个号绑定/解绑代理
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(id, payload.proxy_id) {
+        Ok(_) => {
+            let msg = match payload.proxy_id {
+                Some(pid) => format!("号 #{} 已绑定代理 #{}", id, pid),
+                None => format!("号 #{} 已解绑代理", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

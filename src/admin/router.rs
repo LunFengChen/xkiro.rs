@@ -7,14 +7,17 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, delete_user_preset, export_kam, export_token_json,
+        add_credential, add_proxy, auto_assign_proxies, delete_credential, delete_proxy,
+        delete_user_preset, export_kam, export_token_json,
         force_refresh_balances_batch, force_refresh_token, force_refresh_tokens_batch,
         get_all_credentials, get_cached_balances, get_compression_config, get_credential_balance,
         get_credential_models, get_global_config, get_proxy_config, get_runtime_stats,
-        get_system_prompt, import_token_json, reset_failure_count, set_compression_config,
-        set_credential_concurrency, set_credential_disabled, set_credential_endpoint,
-        set_credential_overage, set_credential_priority, set_credential_region,
-        update_global_config, update_proxy_config, update_system_prompt, upsert_user_preset,
+        get_system_prompt, import_proxies, import_token_json, list_proxies, reset_failure_count,
+        set_compression_config, set_credential_concurrency, set_credential_disabled,
+        set_credential_endpoint, set_credential_overage, set_credential_priority,
+        set_credential_proxy, set_credential_region, test_proxy,
+        update_global_config, update_proxy, update_proxy_config, update_system_prompt,
+        upsert_user_preset,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -75,6 +78,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/region", post(set_credential_region))
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
         .route("/credentials/{id}/overage", post(set_credential_overage))
+        .route("/credentials/{id}/proxy", post(set_credential_proxy))
         .route("/credentials/runtime-stats", get(get_runtime_stats))
         .route(
             "/credentials/refresh-batch",
@@ -93,6 +97,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_global_config).put(update_global_config),
         )
         .route("/proxy", get(get_proxy_config).post(update_proxy_config))
+        // 代理池(引用式绑定)管理
+        .route("/proxies", get(list_proxies).post(add_proxy))
+        .route("/proxies/import", post(import_proxies))
+        .route("/proxies/auto-assign", post(auto_assign_proxies))
+        .route("/proxies/{id}", axum::routing::put(update_proxy).delete(delete_proxy))
+        .route("/proxies/{id}/test", post(test_proxy))
         .route(
             "/config/system-prompt",
             get(get_system_prompt).put(update_system_prompt),

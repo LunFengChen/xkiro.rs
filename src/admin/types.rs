@@ -809,3 +809,97 @@ pub struct UpsertUserPresetRequest {
     pub content: String,
 }
 
+// ============================================================
+// 代理池(引用式绑定)管理 DTO
+// ============================================================
+
+/// 新增/更新代理请求(持久化字段)。id 由后端分配,请求体忽略。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyUpsertRequest {
+    pub url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 每代理并发上限(None/0=不限)
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// 批量导入代理请求:每行 `url` 或 `url,user,pass` 或 `region|url`(宽松解析)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyImportRequest {
+    /// 多行文本,每行一个代理
+    pub text: String,
+    /// 给本批导入统一打的 region(可选,行内未指定时用它)
+    #[serde(default)]
+    pub region: Option<String>,
+    /// 给本批导入统一设的并发上限(可选)
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+}
+
+/// 批量导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyImportResponse {
+    pub added: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+}
+
+/// 单个代理连通性测试结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResponse {
+    pub ok: bool,
+    /// 出口 IP(测试成功时回填)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_ip: Option<String>,
+    /// 往返耗时毫秒
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 自动分配请求:把未绑代理的号按 region 匹配分配可用代理
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyAutoAssignRequest {
+    /// 仅给这些号分配(空=所有未绑定且启用的号)
+    #[serde(default)]
+    pub credential_ids: Vec<u64>,
+    /// 已绑定的号是否覆盖重分(默认 false,只补未绑定的)
+    #[serde(default)]
+    pub reassign_bound: bool,
+}
+
+/// 自动分配响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyAutoAssignResponse {
+    /// 成功分配的 (号 id, 代理 id) 对
+    pub assigned: Vec<(u64, u64)>,
+    /// 没找到可用代理(region 无匹配)的号
+    pub skipped: Vec<u64>,
+}
+
+/// 给单个号绑定/解绑代理请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    /// 目标代理 id;None=解绑(走全局/凭据自身 proxy_url)
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+}
+
+

@@ -158,7 +158,7 @@ async fn main() {
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
+        Some(credentials_path.clone().into()),
         is_multiple_format,
     )
     .unwrap_or_else(|e| {
@@ -166,6 +166,26 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+
+    // 代理池:与 credentials.json 同目录的 proxies.json。引用式绑定的运行时来源。
+    let proxies_path = std::path::Path::new(&credentials_path)
+        .parent()
+        .map(|dir| dir.join(kiro::proxy_manager::ProxyEntry::default_proxies_path()))
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(kiro::proxy_manager::ProxyEntry::default_proxies_path())
+        });
+    let proxy_manager = Arc::new(
+        kiro::proxy_manager::ProxyManager::load_from(&proxies_path).unwrap_or_else(|e| {
+            tracing::error!("加载代理池失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
+    token_manager.set_proxy_manager(Arc::clone(&proxy_manager));
+    tracing::info!(
+        "代理池已加载: {} 条 ({})",
+        proxy_manager.list().len(),
+        proxies_path.display()
+    );
 
     // 启动后台 Token 刷新任务（默认配置：每 60s 检查一次，提前 15 分钟刷新）
     let _background_refresher =
@@ -252,6 +272,7 @@ async fn main() {
                 prompt_runtime.clone(),
                 truncation_recovery_notice.clone(),
                 endpoint_names.clone(),
+                proxy_manager.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
 

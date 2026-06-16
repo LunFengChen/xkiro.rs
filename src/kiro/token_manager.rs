@@ -2797,6 +2797,48 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置指定凭据引用式绑定的代理池 id（Admin API）
+    ///
+    /// 传 `None` 表示解绑，回退到全局/凭据自身 proxy_url。
+    pub fn set_proxy_id(&self, id: u64, proxy_id: Option<u64>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_id = proxy_id;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 取所有凭据的 (id, region, proxy_id) 三元组快照（供代理自动分配用）
+    pub fn credential_region_bindings(&self) -> Vec<(u64, Option<String>, Option<u64>, bool)> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .map(|e| {
+                (
+                    e.id,
+                    e.credentials.region.clone(),
+                    e.credentials.proxy_id,
+                    e.credentials.disabled,
+                )
+            })
+            .collect()
+    }
+
+    /// 取绑定了指定代理 id 的所有凭据 id（供死代理换绑用）
+    pub fn credentials_bound_to_proxy(&self, proxy_id: u64) -> Vec<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| e.credentials.proxy_id == Some(proxy_id))
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
