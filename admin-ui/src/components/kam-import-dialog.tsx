@@ -221,14 +221,23 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       let failCount = 0
       let skippedCount = 0
 
-      for (let i = 0; i < validAccounts.length; i++) {
+      // 并发导入: 固定并发度的工作池, 替代原来的串行 for + sleep(1000)
+      const CONCURRENCY = 5
+      let processed = 0
+      const bumpProgress = () => {
+        processed++
+        setProgress({ current: processed, total: validAccounts.length })
+      }
+
+      // 处理单个账号(供工作池调用)
+      const processOne = async (i: number): Promise<void> => {
         const account = validAccounts[i]
 
         // 跳过 error 状态的账号
         if (skipErrorAccounts && account.status === 'error') {
           skippedCount++
-          setProgress({ current: i + 1, total: validAccounts.length })
-          continue
+          bumpProgress()
+          return
         }
 
         const cred = account.credentials
@@ -242,7 +251,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           return next
         })
 
-        // 检查重复
+        // 检查重复(existingTokenHashes 在并发下用作共享去重集, 已存在则跳过)
         if (existingTokenHashes.has(tokenHash)) {
           duplicateCount++
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
@@ -251,9 +260,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
             return next
           })
-          setProgress({ current: i + 1, total: validAccounts.length })
-          continue
+          bumpProgress()
+          return
         }
+        // 预占, 防止同批次内重复 token 并发重复导入
+        existingTokenHashes.add(tokenHash)
 
         // 验活中
         setResults(prev => {
@@ -285,12 +296,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           addedCredId = addedCred.credentialId
 
-          await new Promise(resolve => setTimeout(resolve, 1000))
-
           const balance = await getCredentialBalance(addedCred.credentialId)
 
           successCount++
-          existingTokenHashes.add(tokenHash)
           setCurrentProcessing(`验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
           setResults(prev => {
             const next = [...prev]
@@ -304,6 +312,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             return next
           })
         } catch (error) {
+          // 失败回滚: 同时回收预占的去重 hash, 以便重试
+          existingTokenHashes.delete(tokenHash)
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
           let rollbackError: string | undefined
 
@@ -331,8 +341,20 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           })
         }
 
-        setProgress({ current: i + 1, total: validAccounts.length })
+        bumpProgress()
       }
+
+      // 工作池: 用游标分发任务给 CONCURRENCY 个 worker, 各自取下一个索引直到取完
+      let cursor = 0
+      const worker = async () => {
+        while (cursor < validAccounts.length) {
+          const i = cursor++
+          await processOne(i)
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, validAccounts.length) }, () => worker())
+      )
 
       // 汇总
       const parts: string[] = []
