@@ -25,6 +25,7 @@ import {
   useForceRefreshToken,
   useSetOverage,
 } from '@/hooks/use-credentials'
+import { useProxies, useSetCredentialProxy } from '@/hooks/use-proxies'
 import { getCredentialBalance } from '@/api/credentials'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { maskEmail } from '@/lib/utils'
@@ -216,6 +217,21 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken()
   const setOverage = useSetOverage()
   const overageMutating = setOverage.isPending
+
+  // 代理绑定：列表用于回显 region/url，setProxy 用于绑定/解绑
+  const { data: proxyData } = useProxies()
+  const setProxy = useSetCredentialProxy()
+  const boundProxy = proxyData?.proxies.find((p) => p.id === credential.proxyId) ?? null
+
+  const handleSetProxy = (proxyId: number | null) => {
+    setProxy.mutate(
+      { id: credential.id, proxyId },
+      {
+        onSuccess: (res) => toast.success(res.message || (proxyId == null ? '已解绑代理' : '已绑定代理')),
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      },
+    )
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -570,6 +586,33 @@ export function CredentialCard({
               <span className="truncate font-mono text-2xs" title={credential.proxyUrl}>{credential.proxyUrl}</span>
             </div>
           )}
+          {/* 代理池绑定（可选择/解绑） */}
+          <div className="col-span-2 flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">代理池</span>
+            <select
+              value={credential.proxyId == null ? '' : String(credential.proxyId)}
+              disabled={setProxy.isPending}
+              onChange={(e) => {
+                const v = e.target.value
+                handleSetProxy(v === '' ? null : parseInt(v, 10))
+              }}
+              className="h-6 max-w-[60%] rounded-md border border-input bg-background px-1.5 text-2xs"
+              title={boundProxy ? boundProxy.url : '未绑定代理池'}
+            >
+              <option value="">未绑定</option>
+              {boundProxy == null && credential.proxyId != null && (
+                <option value={String(credential.proxyId)}>
+                  #{credential.proxyId}（已失效）
+                </option>
+              )}
+              {proxyData?.proxies.map((p) => (
+                <option key={p.id} value={String(p.id)}>
+                  {(p.region ? `${p.region} · ` : '') + p.url}
+                  {p.dead ? '（离线）' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
         {/* === Footer 操作区 === */}

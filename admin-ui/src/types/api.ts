@@ -31,6 +31,10 @@ export interface CredentialStatusItem {
   maxPermits: number
   /** 该凭据自定义并发上限（null = 跟随全局 perCredentialConcurrency） */
   concurrency: number | null
+  /** 绑定的代理 ID（null = 未绑定代理池） */
+  proxyId: number | null
+  /** 凭据 region（出口区域标识） */
+  region?: string
 }
 
 // 全局配置响应
@@ -308,4 +312,88 @@ export interface UpsertUserPresetRequest {
   name: string
   description?: string
   content: string
+}
+
+// ============ 代理池（proxy pool） ============
+
+/** 单个代理状态（GET /proxies 列表项，后端 camelCase） */
+export interface ProxyItem {
+  id: number
+  url: string
+  username?: string | null
+  region?: string | null
+  maxConcurrency: number
+  disabled: boolean
+  note?: string | null
+  /** 健康巡检判定为不可用 */
+  dead: boolean
+  /** 连续失败次数 */
+  consecutiveFailures: number
+  /** 最近一次错误信息 */
+  lastError?: string | null
+  /** 最近一次探测时间（ISO 字符串） */
+  lastChecked?: string | null
+  /** 当前可用 permit 数 */
+  availablePermits: number
+  /** 已绑定的凭据数量 */
+  boundCredentials: number
+}
+
+/** GET /proxies 响应 */
+export interface ProxyListResponse {
+  proxies: ProxyItem[]
+}
+
+/** POST /proxies、PUT /proxies/:id 请求体 */
+export interface ProxyUpsertRequest {
+  url: string
+  username?: string
+  password?: string
+  region?: string
+  maxConcurrency?: number
+  disabled: boolean
+  note?: string
+}
+
+/** POST /proxies/:id/test 响应 */
+export interface ProxyTestResponse {
+  ok: boolean
+  exitIp?: string | null
+  latencyMs?: number | null
+  error?: string | null
+}
+
+/** POST /proxies/import 请求体（text 多行，每行 url 或 url,user,pass） */
+export interface ProxyImportRequest {
+  text: string
+  region?: string
+  maxConcurrency?: number
+}
+
+/** POST /proxies/import 响应 */
+export interface ProxyImportResponse {
+  added: number
+  failed: number
+  errors: string[]
+}
+
+/** POST /proxies/auto-assign 请求体 */
+export interface ProxyAutoAssignRequest {
+  /** 空数组 = 对所有未绑定凭据自动分配 */
+  credentialIds: number[]
+  /** 是否对已绑定凭据重新分配 */
+  reassignBound: boolean
+}
+
+/** POST /proxies/auto-assign 响应 */
+export interface ProxyAutoAssignResponse {
+  /** [credentialId, proxyId] 分配结果 */
+  assigned: [number, number][]
+  /** 跳过的 credentialId 列表 */
+  skipped: number[]
+}
+
+/** POST /credentials/:id/proxy 请求体（null = 解绑） */
+export interface SetCredentialProxyRequest {
+  proxyId: number | null
 }
