@@ -14,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -458,27 +458,8 @@ pub(crate) async fn set_user_preference(
 /// 解析路径的真实目标（穿透 symlink）。
 ///
 /// 用于 `persist_credentials` 的原子写入：保证 rename 替换的是 symlink
-/// 指向的真实文件，而不是 symlink 本身。
-///
-/// 优先 `canonicalize`（目标存在时最可靠），失败时 fallback 到 `read_link`，
-/// 都失败则返回原路径（保持向后兼容）。
-fn resolve_symlink_target(path: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-
-    if let Ok(target) = std::fs::read_link(path) {
-        if target.is_absolute() {
-            return target;
-        }
-        if let Some(parent) = path.parent() {
-            return parent.join(target);
-        }
-        return target;
-    }
-
-    path.to_path_buf()
-}
+/// 指向的真实文件，而不是 symlink 本身。实现已统一到 `common::io`。
+use crate::common::io::resolve_symlink_target;
 
 /// 单个凭据条目的状态
 struct CredentialEntry {

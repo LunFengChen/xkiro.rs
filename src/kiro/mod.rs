@@ -9,5 +9,6 @@ pub mod model;
 pub mod models;
 pub mod parser;
 pub mod provider;
+pub mod proxy_manager;
 pub mod token_manager;
 pub mod web_portal;
