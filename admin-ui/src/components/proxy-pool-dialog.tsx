@@ -560,6 +560,10 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
           <textarea
             value={importText}
             onChange={(e) => setImportText(e.target.value)}
+            onBlur={(e) => {
+              const fixed = ensureProxySchemeBlock(e.target.value)
+              if (fixed !== importText) setImportText(fixed)
+            }}
             rows={5}
             placeholder={'38.111.61.59:443:user:pass\nsocks5://1.2.3.4:1080\nhttp://5.6.7.8:8080,user,pass'}
             className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
