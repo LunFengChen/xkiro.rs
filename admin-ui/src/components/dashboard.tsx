@@ -18,6 +18,7 @@ import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useDisableBatch } from '@/hooks/use-credentials'
+import { useProxies } from '@/hooks/use-proxies'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
 import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam, deleteCredentialsBatch } from '@/api/credentials'
@@ -82,6 +83,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { mutateAsync: disableBatch } = useDisableBatch()
   const { data: runtimeMap } = useRuntimeStats()
+  const { data: proxyData } = useProxies()
 
   // 按组/渠道过滤
   const [filterGroup, setFilterGroup] = useState<string>('')
@@ -1082,10 +1084,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <span className="w-44 shrink-0">邮箱</span>
                   <span className="w-20 shrink-0">来源</span>
                   <span className="w-24 shrink-0">订阅</span>
-                  <span className="flex-1 min-w-[220px]">配额 / 超额</span>
+                  <span className="flex-1 min-w-[160px]">配额 / 超额</span>
                   <span className="w-16 shrink-0 text-center">状态</span>
                   <span className="w-28 shrink-0">配额重置</span>
                   <span className="w-20 shrink-0">分组</span>
+                  <span className="w-28 shrink-0">代理</span>
                 </div>
                 {/* 行 */}
                 <div className="divide-y divide-border">
@@ -1130,11 +1133,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                             ? <span className="inline-block px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-medium truncate max-w-full" title={sub}>{sub}</span>
                             : <span className="text-muted-foreground/40">—</span>}
                         </div>
-                        {/* 配额：主条 + 超额条 并排 */}
-                        <div className="flex-1 min-w-[220px] flex items-center gap-5">
+                        {/* 配额：主条 + 超额条 上下叠放 */}
+                        <div className="flex-1 min-w-[160px] flex flex-col gap-1">
                           {/* 主配额 */}
-                          <div className="flex-1 flex items-center gap-2">
-                            <span className="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+                          <div className="flex items-center gap-2">
+                            <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground text-2xs">
                               {limit > 0 ? <><span className="text-foreground font-medium">{Math.round(baseRemaining)}</span>/{limit}</> : '—'}
                             </span>
                             <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
@@ -1146,8 +1149,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                           </div>
                           {/* 超额 */}
                           {(overCap > 0 || overageOn) ? (
-                            <div className="flex-1 flex items-center gap-2">
-                              <span className="w-24 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
+                            <div className="flex items-center gap-2">
+                              <span className="w-16 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 text-2xs flex items-center justify-end gap-0.5">
                                 ⚡{overCap > 0 ? <><span className="font-medium">{Math.round(overRemaining)}</span>/{overCap}</> : '已开'}
                               </span>
                               <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
@@ -1157,9 +1160,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                                 />
                               </div>
                             </div>
-                          ) : (
-                            <div className="flex-1 text-muted-foreground/30 text-center">—</div>
-                          )}
+                          ) : null}
                         </div>
                         {/* 状态 */}
                         <div className="w-16 shrink-0 text-center">
@@ -1178,6 +1179,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
                           {credential.group
                             ? <span className="inline-block px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-500 truncate max-w-full" title={credential.group}>{credential.group}</span>
                             : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 代理 */}
+                        <div className="w-28 shrink-0">
+                          {(() => {
+                            const bp = proxyData?.proxies.find((p) => p.id === credential.proxyId)
+                            if (!bp) return <span className="text-muted-foreground/40">—</span>
+                            const label = (bp.region ? `${bp.region} · ` : '') + bp.url.replace(/^https?:\/\//, '').replace(/^socks5?:\/\//, '')
+                            return (
+                              <span
+                                className={`inline-block truncate max-w-full px-1.5 py-0.5 rounded font-mono text-2xs ${bp.dead ? 'bg-destructive/15 text-destructive' : 'bg-muted text-muted-foreground'}`}
+                                title={bp.url}
+                              >
+                                {label}
+                              </span>
+                            )
+                          })()}
                         </div>
                       </div>
                     )
