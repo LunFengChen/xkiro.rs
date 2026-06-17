@@ -17,6 +17,7 @@ use super::{
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
     },
 };
+use axum::http::StatusCode;
 use crate::model::config::CompressionConfig;
 
 /// GET /api/admin/credentials
@@ -210,13 +211,30 @@ pub async fn set_compression_config(
 }
 
 /// POST /api/admin/credentials/import-token-json
-/// 批量导入 token.json
+/// 启动后台批量导入，立即返回 job_id
 pub async fn import_token_json(
     State(state): State<AdminState>,
     Json(payload): Json<ImportTokenJsonRequest>,
 ) -> impl IntoResponse {
-    let response = state.service.import_token_json(payload).await;
+    use std::sync::Arc;
+    let response = Arc::clone(&state.service).start_import_token_json(payload);
     Json(response)
+}
+
+/// GET /api/admin/credentials/import-jobs/:job_id
+/// 查询后台导入任务进度
+pub async fn get_import_job(
+    State(state): State<AdminState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.get_import_job(&job_id) {
+        Some(snap) => Json(snap).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/export-token-json

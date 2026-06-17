@@ -25,11 +25,12 @@ use super::types::{
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
     CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
-    ImportAction, ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
+    ImportAction, ImportItemResult, ImportJobSnapshot, ImportJobStatus, ImportSummary,
+    ImportTokenJsonRequest, ImportTokenJsonResponse,
     PresetItem,
     ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse, ProxyImportRequest,
     ProxyImportResponse, ProxyTestResponse, ProxyUpsertRequest, RuntimeBalanceSnapshot,
-    RuntimeStatsItem, RuntimeStatsResponse,
+    RuntimeStatsItem, RuntimeStatsResponse, StartImportJobResponse,
     SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
     UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
     UpsertUserPresetRequest,
@@ -103,6 +104,8 @@ pub struct AdminService {
     models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
     /// 代理池(引用式绑定的运行时来源)。admin 管理 CRUD/测试/分配。
     proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
+    /// 后台导入任务状态表 (job_id → snapshot)
+    import_jobs: Arc<Mutex<HashMap<String, ImportJobSnapshot>>>,
 }
 
 impl AdminService {
@@ -135,6 +138,7 @@ impl AdminService {
             balance_semaphore: Arc::new(Semaphore::new(8)),
             models_cache: Mutex::new(HashMap::new()),
             proxy_manager,
+            import_jobs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -802,6 +806,7 @@ impl AdminService {
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             concurrency: req.concurrency,
+            group: req.group.clone(),
         };
 
         // 调用 token_manager 添加凭据
@@ -2142,21 +2147,96 @@ impl AdminService {
 
     // ============ 批量导入 token.json ============
 
-    /// 批量导入 token.json
+    /// 启动后台批量导入，立即返回 job_id（由 handler 传入 Arc<Self>）
+    pub fn start_import_token_json(
+        self: Arc<Self>,
+        req: ImportTokenJsonRequest,
+    ) -> StartImportJobResponse {
+        let items = req.items.into_vec();
+        let dry_run = req.dry_run;
+        let total = items.len();
+
+        // 生成唯一 job_id（毫秒时间戳 + 总数，足够区分同机并发批次）
+        let job_id = format!(
+            "import-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            total
+        );
+
+        // 初始化快照
+        self.import_jobs.lock().insert(
+            job_id.clone(),
+            ImportJobSnapshot {
+                job_id: job_id.clone(),
+                status: ImportJobStatus::Running,
+                total,
+                done: 0,
+                added: 0,
+                skipped: 0,
+                invalid: 0,
+                error: None,
+            },
+        );
+
+        let import_jobs = Arc::clone(&self.import_jobs);
+        let svc = Arc::clone(&self);
+        let job_id_bg = job_id.clone();
+
+        tokio::spawn(async move {
+            let result = svc
+                .import_token_json_inner(items, dry_run, {
+                    let import_jobs = Arc::clone(&import_jobs);
+                    let jid = job_id_bg.clone();
+                    move |added_d: usize, skipped_d: usize, invalid_d: usize| {
+                        let mut jobs = import_jobs.lock();
+                        if let Some(snap) = jobs.get_mut(&jid) {
+                            snap.done += 1;
+                            snap.added += added_d;
+                            snap.skipped += skipped_d;
+                            snap.invalid += invalid_d;
+                        }
+                    }
+                })
+                .await;
+
+            let mut jobs = import_jobs.lock();
+            if let Some(snap) = jobs.get_mut(&job_id_bg) {
+                snap.status = ImportJobStatus::Done;
+                snap.added = result.summary.added;
+                snap.skipped = result.summary.skipped;
+                snap.invalid = result.summary.invalid;
+                snap.done = result.summary.parsed;
+            }
+        });
+
+        StartImportJobResponse { job_id, total }
+    }
+
+    /// 查询后台导入任务进度
+    pub fn get_import_job(&self, job_id: &str) -> Option<ImportJobSnapshot> {
+        self.import_jobs.lock().get(job_id).cloned()
+    }
+
+    /// 批量导入内部核心逻辑（同步执行，供后台 task 和旧接口共用）
     ///
     /// 解析官方 token.json 格式，按 provider 字段自动映射 authMethod：
     /// - BuilderId/builder-id/idc → idc
     /// - Social/social → social
-    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+    async fn import_token_json_inner<F>(
+        &self,
+        items: Vec<TokenJsonItem>,
+        dry_run: bool,
+        mut on_item_done: F,
+    ) -> ImportTokenJsonResponse
+    where
+        F: FnMut(usize, usize, usize) + Send + 'static,
+    {
         use futures::stream::{self, StreamExt};
-
-        let items = req.items.into_vec();
-        let dry_run = req.dry_run;
 
         /// 导入并发度：5 路并发刷新首验，兼顾速度与上游限流
         const IMPORT_CONCURRENCY: usize = 5;
 
-        // 同一请求内按 refreshToken 去重，避免并发下两条相同 token 同时通过去重检查
+        // 同一批次按 refreshToken 去重
         let mut seen_tokens = std::collections::HashSet::new();
         let prepared: Vec<(usize, TokenJsonItem, bool)> = items
             .into_iter()
@@ -2171,7 +2251,7 @@ impl AdminService {
             })
             .collect();
 
-        // 并发处理；buffer_unordered 限制在途任务数，结果顺序随完成顺序，最后按 index 排序
+        // 并发处理；结果按 index 排序还原
         let mut results: Vec<ImportItemResult> = stream::iter(prepared)
             .map(|(index, item, dup_in_batch)| async move {
                 if dup_in_batch {
@@ -2197,9 +2277,9 @@ impl AdminService {
         let mut invalid = 0usize;
         for result in &results {
             match result.action {
-                ImportAction::Added => added += 1,
-                ImportAction::Skipped => skipped += 1,
-                ImportAction::Invalid => invalid += 1,
+                ImportAction::Added => { added += 1; on_item_done(1, 0, 0); }
+                ImportAction::Skipped => { skipped += 1; on_item_done(0, 1, 0); }
+                ImportAction::Invalid => { invalid += 1; on_item_done(0, 0, 1); }
             }
         }
 
@@ -2212,6 +2292,12 @@ impl AdminService {
             },
             items: results,
         }
+    }
+
+    /// 旧接口保留：同步等待全部完成（供测试/脚本直接调用）
+    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+        let items = req.items.into_vec();
+        self.import_token_json_inner(items, req.dry_run, |_, _, _| {}).await
     }
 
     /// 处理单个 token.json 项
@@ -2307,6 +2393,7 @@ impl AdminService {
             proxy_id: None,
             disabled: false,
             concurrency: None,
+            group: None,
         };
 
         match self.token_manager.add_credential(new_cred, false).await {

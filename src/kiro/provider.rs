@@ -175,8 +175,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false, user_id).await
+        self.call_api_with_retry(request_body, false, user_id, group).await
     }
 
     /// 发送流式 API 请求
@@ -184,8 +185,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true, user_id).await
+        self.call_api_with_retry(request_body, true, user_id, group).await
     }
 
     /// 获取内部 `MultiTokenManager` 引用（用于在请求生命周期外同步运行时缓存，
@@ -199,8 +201,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<McpCallResult> {
-        self.call_mcp_with_retry(request_body, user_id).await
+        self.call_mcp_with_retry(request_body, user_id, group).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
@@ -208,6 +211,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -216,7 +220,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let mut ctx = match self.token_manager.acquire_context_for_session(user_id, None).await {
+            let mut ctx = match self.token_manager.acquire_context_for_session(user_id, None, group).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -387,6 +391,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         user_id: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -401,7 +406,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_for_session(user_id, model.as_deref())
+                .acquire_context_for_session(user_id, model.as_deref(), group)
                 .await
             {
                 Ok(c) => c,

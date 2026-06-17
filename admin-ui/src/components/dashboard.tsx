@@ -12,6 +12,7 @@ import { ModelsDialog } from '@/components/models-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { ImportJobToast } from '@/components/import-job-toast'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
@@ -34,6 +35,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [activeImportJob, setActiveImportJob] = useState<{ jobId: string; total: number } | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
@@ -1058,7 +1060,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+        onJobStart={(jobId, total) => setActiveImportJob({ jobId, total })}
       />
+
+      {/* KAM 后台导入进度浮窗 */}
+      {activeImportJob && (
+        <ImportJobToast
+          jobId={activeImportJob.jobId}
+          total={activeImportJob.total}
+          onDone={() => setActiveImportJob(null)}
+        />
+      )}
 
       {/* 批量验活对话框 */}
       <BatchVerifyDialog

@@ -191,6 +191,10 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号分组标签（可选，用于按组路由 API key）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -505,6 +509,40 @@ pub enum ImportAction {
     Added,
     Skipped,
     Invalid,
+}
+
+// ============ 后台导入 Job ============
+
+/// 后台导入任务状态
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportJobStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// 后台导入任务快照（轮询接口返回）
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportJobSnapshot {
+    pub job_id: String,
+    pub status: ImportJobStatus,
+    pub total: usize,
+    pub done: usize,
+    pub added: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 启动后台导入的响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartImportJobResponse {
+    pub job_id: String,
+    pub total: usize,
 }
 
 // ============ 导出 token.json ============

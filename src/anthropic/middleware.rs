@@ -15,8 +15,13 @@ use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompressionConfig, PromptFilterConfig};
+use crate::model::config::{ApiKeyEntry, CompressionConfig, PromptFilterConfig};
 use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
+
+/// Request extension：鉴权时解析出的账号组（来自 api_keys 配置的 group 字段）
+/// None = 无分组限制（单 api_key 兼容模式，或 api_keys 中未配 group 的条目）
+#[derive(Clone, Debug)]
+pub struct AuthGroup(pub Option<String>);
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -69,8 +74,11 @@ impl PromptCacheRuntime {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
+    /// API 密钥（单 key 兼容模式）
     pub api_key: String,
+    /// 多 API Key 配置（带可选分组）
+    /// 非空时鉴权优先查此列表，空时回退到 api_key 单 key 模式
+    pub api_keys: Vec<ApiKeyEntry>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -100,6 +108,7 @@ impl AppState {
     ) -> Self {
         Self {
             api_key: api_key.into(),
+            api_keys: vec![],
             kiro_provider: None,
             extract_thinking,
             profile_arn: None,
@@ -158,17 +167,41 @@ impl AppState {
 }
 
 /// API Key 认证中间件
+///
+/// 鉴权逻辑：
+/// 1. 若 `api_keys` 非空，按列表顺序做 constant-time 比较，匹配则注入 `AuthGroup`
+/// 2. 否则回退到 `api_key` 单 key 模式（AuthGroup = None）
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+    let Some(key) = auth::extract_api_key(&request) else {
+        let error = ErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    };
+
+    if !state.api_keys.is_empty() {
+        // 多 key 模式：查匹配，写入解析出的分组
+        if let Some(entry) = state
+            .api_keys
+            .iter()
+            .find(|e| auth::constant_time_eq(&key, &e.key))
+        {
+            request.extensions_mut().insert(AuthGroup(entry.group.clone()));
+            return next.run(request).await;
         }
+        let error = ErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    }
+
+    // 单 key 兼容模式
+    if auth::constant_time_eq(&key, &state.api_key) {
+        request.extensions_mut().insert(AuthGroup(None));
+        next.run(request).await
+    } else {
+        let error = ErrorResponse::authentication_error();
+        (StatusCode::UNAUTHORIZED, Json(error)).into_response()
     }
 }
 

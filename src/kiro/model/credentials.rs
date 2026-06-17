@@ -125,6 +125,15 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号分组标签（可选）
+    ///
+    /// 用于将账号隔离到不同的调用组，配合 `Config.api_keys` 的 `group` 字段实现
+    /// "某个 API Key 只走某组账号"的策略。
+    /// - `None` → 无分组，所有不带 group 限制的 API key 都可调用
+    /// - `Some("admin")` → 仅 group="admin" 的 API key 可调用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）

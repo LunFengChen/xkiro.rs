@@ -10,7 +10,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Extension, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -23,7 +23,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request, extract_session_id};
-use super::middleware::AppState;
+use super::middleware::{AppState, AuthGroup};
 use super::stream::{BufferedStreamContext, CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -74,6 +74,8 @@ struct StreamRequestContext<'a> {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
+    /// 从 auth 中间件注入的账号分组（None = 不限分组）
+    group: Option<&'a str>,
 }
 
 /// 非流式请求上下文（同上）
@@ -87,6 +89,8 @@ struct NonStreamRequestContext<'a> {
     user_id: Option<&'a str>,
     cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
+    /// 从 auth 中间件注入的账号分组（None = 不限分组）
+    group: Option<&'a str>,
 }
 
 /// 从 payload + 总输入 token 构造 cache 画像
@@ -852,6 +856,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(auth_group): Extension<AuthGroup>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1102,6 +1107,9 @@ pub async fn post_messages(
     // 提取 session_id 作为亲和 key；裸 user_id 是机器哈希常量，不能作 key
     let session_id_owned = raw_user_id.and_then(extract_session_id);
     let user_id = session_id_owned.as_deref();
+    // 从 auth 中间件注入的账号分组（None = 不限分组）
+    let group_owned = auth_group.0.clone();
+    let group = group_owned.as_deref();
 
     // 读 prompt-cache 快照 + 按 accounting_enabled 构造 cache_profile（BK 模式）
     let prompt_cache = state.prompt_cache_snapshot();
@@ -1122,6 +1130,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map: tool_name_map.clone(),
             user_id,
+            group,
         };
         handle_stream_request(provider, stream_request).await
     } else {
@@ -1137,6 +1146,7 @@ pub async fn post_messages(
                 .accounting_enabled
                 .then_some(&prompt_cache.tracker),
             cache_profile: cache_profile.as_ref(),
+            group,
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -1149,7 +1159,7 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut api_result = match provider
-        .call_api_stream(context.request_body, context.user_id)
+        .call_api_stream(context.request_body, context.user_id, context.group)
         .await
     {
         Ok(resp) => resp,
@@ -1338,7 +1348,7 @@ async fn handle_non_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api(context.request_body, context.user_id)
+        .call_api(context.request_body, context.user_id, context.group)
         .await
     {
         Ok(resp) => resp,
@@ -1797,6 +1807,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(auth_group): Extension<AuthGroup>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -2012,6 +2023,8 @@ pub async fn post_messages_cc(
         .and_then(|m| m.user_id.as_deref());
     let session_id_owned = raw_user_id.and_then(extract_session_id);
     let user_id = session_id_owned.as_deref();
+    let group_owned_cc = auth_group.0.clone();
+    let group = group_owned_cc.as_deref();
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -2023,6 +2036,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             user_id,
+            group,
         )
         .await
     } else {
@@ -2039,6 +2053,7 @@ pub async fn post_messages_cc(
             user_id,
             cache_tracker: None,
             cache_profile: None,
+            group,
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -2056,9 +2071,10 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&str>,
+    group: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let mut api_result = match provider.call_api_stream(request_body, user_id).await {
+    let mut api_result = match provider.call_api_stream(request_body, user_id, group).await {
         Ok(resp) => resp,
         Err(e) => return map_kiro_provider_error_to_response(request_body, e),
     };

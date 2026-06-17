@@ -241,6 +241,7 @@ async fn main() {
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
+        config.api_keys.clone(),
         Some(kiro_provider.clone()),
         first_credentials.profile_arn.clone(),
         config.extract_thinking,

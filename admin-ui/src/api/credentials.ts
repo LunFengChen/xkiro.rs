@@ -346,3 +346,43 @@ export async function deleteUserPreset(id: string): Promise<SystemPromptResponse
   )
   return data
 }
+
+// ─── 后台导入 Job ──────────────────────────────────────────────────────────
+
+export type ImportJobStatus = 'Running' | 'Done' | 'Failed'
+
+export interface ImportJobSnapshot {
+  jobId: string
+  status: ImportJobStatus
+  total: number
+  done: number
+  added: number
+  skipped: number
+  invalid: number
+  error?: string
+}
+
+export interface StartImportJobResponse {
+  jobId: string
+  total: number
+}
+
+/** 启动后台 token.json 导入（立即返回 jobId，不等待完成） */
+export async function startImportJob(
+  items: object[],
+  dryRun = false,
+): Promise<StartImportJobResponse> {
+  const { data } = await api.post<StartImportJobResponse>(
+    '/credentials/import-token-json',
+    { items, dryRun },
+  )
+  return data
+}
+
+/** 查询后台导入任务进度 */
+export async function getImportJob(jobId: string): Promise<ImportJobSnapshot> {
+  const { data } = await api.get<ImportJobSnapshot>(
+    `/credentials/import-jobs/${encodeURIComponent(jobId)}`,
+  )
+  return data
+}

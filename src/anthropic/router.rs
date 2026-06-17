@@ -11,7 +11,7 @@ use axum::{
 use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompressionConfig, PromptFilterConfig};
+use crate::model::config::{ApiKeyEntry, CompressionConfig, PromptFilterConfig};
 use crate::model::runtime::SharedPromptConfig;
 
 use super::{
@@ -41,6 +41,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `Authorization: Bearer ***` header
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
+    api_keys: Vec<ApiKeyEntry>,
     kiro_provider: Option<Arc<KiroProvider>>,
     profile_arn: Option<String>,
     extract_thinking: bool,
@@ -59,6 +60,7 @@ pub fn create_router_with_provider(
         .with_compression_config(compression)
         .with_prompt_filter_config(prompt_filter)
         .with_prompt_runtime(prompt_runtime);
+    state.api_keys = api_keys;
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
