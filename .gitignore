@@ -8,6 +8,9 @@
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
+# pnpm v10 会在 admin-ui 生成 allowBuilds 占位的 workspace 文件,
+# 它让 Docker 里 `pnpm build` 报 "packages field missing or empty"。永久忽略。
+/admin-ui/pnpm-workspace.yaml
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
