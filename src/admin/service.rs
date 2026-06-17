@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use anyhow::Context;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,12 @@ pub struct AdminService {
     proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
     /// 后台导入任务状态表 (job_id → snapshot)
     import_jobs: Arc<Mutex<HashMap<String, ImportJobSnapshot>>>,
+    /// 共享多 API Key 列表（与鉴权中间件同源，写入即热生效）
+    api_keys: crate::anthropic::middleware::SharedApiKeys,
+    /// config.json 路径（持久化 api_keys 增删）
+    config_path: Option<PathBuf>,
+    /// 请求时序埋点
+    pub metrics: crate::admin::metrics::SharedMetrics,
 }
 
 impl AdminService {
@@ -119,6 +126,9 @@ impl AdminService {
         truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
         known_endpoints: impl IntoIterator<Item = String>,
         proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
+        api_keys: crate::anthropic::middleware::SharedApiKeys,
+        config_path: Option<PathBuf>,
+        metrics: crate::admin::metrics::SharedMetrics,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -140,6 +150,9 @@ impl AdminService {
             models_cache: Mutex::new(HashMap::new()),
             proxy_manager,
             import_jobs: Arc::new(Mutex::new(HashMap::new())),
+            api_keys,
+            config_path,
+            metrics,
         }
     }
 
@@ -2813,6 +2826,116 @@ impl AdminService {
                 error: Some(format!("代理连接失败: {}", e)),
             },
         }
+    }
+
+    // ============ Dashboard 聚合 ============
+
+    /// 总览 KPI（1h / 24h 双窗口）
+    pub fn dashboard_overview(&self) -> crate::admin::metrics::DashboardOverview {
+        let now = chrono::Utc::now().timestamp();
+        self.metrics.overview(now)
+    }
+
+    /// 时序折线数据（window_minutes=60, interval_minutes=5 → 12 个点）
+    pub fn dashboard_series(
+        &self,
+        window_minutes: u64,
+        interval_minutes: u64,
+    ) -> Vec<crate::admin::metrics::SeriesBucket> {
+        let now = chrono::Utc::now().timestamp();
+        self.metrics.series(now, window_minutes, interval_minutes)
+    }
+
+    // ============ API Key 管理 ============
+
+    /// key → 稳定 id（sha256 前 12 位 hex）
+    fn api_key_id(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(key.as_bytes());
+        hex::encode(h.finalize())[..12].to_string()
+    }
+
+    /// 脱敏展示：保留前 11 位（sk-xkiro- 前缀区）与后 4 位
+    fn mask_api_key(key: &str) -> String {
+        let n = key.chars().count();
+        if n <= 12 {
+            // 太短：只露后两位
+            let tail: String = key.chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
+            return format!("…{}", tail);
+        }
+        let head: String = key.chars().take(11).collect();
+        let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{}…{}", head, tail)
+    }
+
+    /// 列出全部 API Key（脱敏）
+    pub fn list_api_keys(&self) -> Vec<crate::admin::types::ApiKeyItem> {
+        self.api_keys
+            .read()
+            .iter()
+            .map(|e| crate::admin::types::ApiKeyItem {
+                masked: Self::mask_api_key(&e.key),
+                id: Self::api_key_id(&e.key),
+                group: e.group.clone(),
+            })
+            .collect()
+    }
+
+    /// 新增 API Key；key 留空则自动生成 sk-xkiro-<32hex>
+    pub fn add_api_key(
+        &self,
+        req: crate::admin::types::CreateApiKeyRequest,
+    ) -> anyhow::Result<crate::admin::types::CreateApiKeyResponse> {
+        let key = req
+            .key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| format!("sk-xkiro-{}", uuid::Uuid::new_v4().simple()));
+        let group = req
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty());
+
+        {
+            let mut keys = self.api_keys.write();
+            if keys.iter().any(|e| e.key == key) {
+                anyhow::bail!("该 API Key 已存在");
+            }
+            keys.push(crate::model::config::ApiKeyEntry {
+                key: key.clone(),
+                group: group.clone(),
+            });
+        }
+        self.persist_api_keys()?;
+        Ok(crate::admin::types::CreateApiKeyResponse { key, group })
+    }
+
+    /// 按 id（sha256 前缀）删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> anyhow::Result<()> {
+        let before = self.api_keys.read().len();
+        self.api_keys
+            .write()
+            .retain(|e| Self::api_key_id(&e.key) != id);
+        let after = self.api_keys.read().len();
+        if before == after {
+            anyhow::bail!("未找到对应 API Key");
+        }
+        self.persist_api_keys()?;
+        Ok(())
+    }
+
+    /// 把当前内存中的 api_keys 写回 config.json（重载后覆盖 api_keys 字段再原子保存）
+    fn persist_api_keys(&self) -> anyhow::Result<()> {
+        let Some(path) = self.config_path.as_ref() else {
+            tracing::warn!("config_path 未知，API Key 变更仅在内存生效，重启后丢失");
+            return Ok(());
+        };
+        let mut config = crate::model::config::Config::load(path)
+            .with_context(|| format!("重载配置失败: {}", path.display()))?;
+        config.api_keys = self.api_keys.read().clone();
+        config.save().context("保存 config.json 失败")?;
+        Ok(())
     }
 }
 

@@ -11,7 +11,7 @@ use axum::{
 use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{ApiKeyEntry, CompressionConfig, PromptFilterConfig};
+use crate::model::config::{CompressionConfig, PromptFilterConfig};
 use crate::model::runtime::SharedPromptConfig;
 
 use super::{
@@ -41,7 +41,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `Authorization: Bearer ***` header
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
-    api_keys: Vec<ApiKeyEntry>,
+    api_keys: super::middleware::SharedApiKeys,
     kiro_provider: Option<Arc<KiroProvider>>,
     profile_arn: Option<String>,
     extract_thinking: bool,
@@ -50,6 +50,7 @@ pub fn create_router_with_provider(
     prompt_runtime: SharedPromptConfig,
     prompt_cache_runtime: Arc<RwLock<super::middleware::PromptCacheRuntime>>,
     truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
+    metrics: Option<crate::admin::metrics::SharedMetrics>,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
@@ -66,6 +67,9 @@ pub fn create_router_with_provider(
     }
     if let Some(arn) = profile_arn {
         state = state.with_profile_arn(arn);
+    }
+    if let Some(m) = metrics {
+        state = state.with_metrics(m);
     }
 
     // 需要认证的 /v1 路由

@@ -17,9 +17,11 @@ use super::{
         SetOverageRequest, SetPriorityRequest, SetRegionRequest, SetSourceRequest,
         SuccessResponse, UpdateGlobalConfigRequest,
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
+        CreateApiKeyRequest,
     },
 };
 use axum::http::StatusCode;
+use crate::admin::types::AdminErrorResponse;
 use crate::model::config::CompressionConfig;
 
 /// GET /api/admin/credentials
@@ -551,4 +553,70 @@ pub async fn set_credential_proxy(
         }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+// ============================================================
+// API Key 管理 handlers
+// ============================================================
+
+/// GET /api/admin/api-keys — 列出全部 API Key（脱敏）
+pub async fn list_api_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_api_keys())
+}
+
+/// POST /api/admin/api-keys — 新建 API Key（明文只在响应里回显一次）
+pub async fn create_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.add_api_key(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/api-keys/:id — 按 id（sha256 前缀）删除
+pub async fn delete_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_api_key(&id) {
+        Ok(()) => Json(SuccessResponse::new("API Key 已删除")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================
+// Dashboard 聚合 handlers
+// ============================================================
+
+/// GET /api/admin/dashboard/overview
+/// 总览 KPI（1h / 24h 双窗口 + 模型 Top10）
+pub async fn dashboard_overview(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.dashboard_overview())
+}
+
+/// GET /api/admin/dashboard/series?window=60&interval=5
+/// 时序折线（window/interval 单位均为分钟，默认 60/5）
+pub async fn dashboard_series(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let window: u64 = params
+        .get("window")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let interval: u64 = params
+        .get("interval")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    Json(state.service.dashboard_series(window, interval))
 }

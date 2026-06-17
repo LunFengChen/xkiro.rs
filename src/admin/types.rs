@@ -1004,3 +1004,44 @@ pub struct SetCredentialProxyRequest {
 }
 
 
+
+// ============ API Key 管理 ============
+
+/// API Key 列表项（明文脱敏，只回显前缀+后4位）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyItem {
+    /// 脱敏后的展示串，如 `sk-xkiro-abcd…wxyz`
+    pub masked: String,
+    /// 完整 key 的 sha256 前 12 位，作为删除时的稳定标识（避免传明文）
+    pub id: String,
+    /// 绑定分组（None=可访问所有无分组账号）
+    pub group: Option<String>,
+}
+
+/// 新建 API Key 请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyRequest {
+    /// 留空则自动生成 sk-xkiro-<32hex>
+    #[serde(default)]
+    pub key: Option<String>,
+    /// 绑定分组（可选）
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// 新建 API Key 响应（明文只在此返回一次）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyResponse {
+    pub key: String,
+    pub group: Option<String>,
+}
+
+/// 删除 API Key 请求（按 id=sha256 前缀定位）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteApiKeyRequest {
+    pub id: String,
+}

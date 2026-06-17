@@ -1,6 +1,16 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { Loader2, Plus, Trash2, Wifi, Pencil, X, Wand2 } from 'lucide-react'
+import {
+  Loader2,
+  Plus,
+  Trash2,
+  Wifi,
+  Pencil,
+  X,
+  Wand2,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -87,6 +97,32 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
   const [importMaxConcurrency, setImportMaxConcurrency] = useState('')
 
   const proxies = data?.proxies ?? []
+
+  // Group proxies by region (ungrouped → '未分组')
+  const groupedProxies = useMemo(() => {
+    const map = new Map<string, typeof proxies>()
+    for (const p of proxies) {
+      const key = p.region?.trim() || '未分组'
+      if (!map.has(key)) map.set(key, [])
+      map.get(key)!.push(p)
+    }
+    // Sort: named groups first (alphabetical), then '未分组'
+    return [...map.entries()].sort(([a], [b]) => {
+      if (a === '未分组') return 1
+      if (b === '未分组') return -1
+      return a.localeCompare(b)
+    })
+  }, [proxies])
+
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const toggleGroup = (group: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(group)) next.delete(group)
+      else next.add(group)
+      return next
+    })
+  }
 
   useEffect(() => {
     if (!open) {
@@ -261,94 +297,124 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
               暂无代理，请在下方新增或批量导入。
             </div>
           ) : (
-            <div className="space-y-1.5">
-              {proxies.map((p) => (
-                <div
-                  key={p.id}
-                  className="flex items-center gap-3 rounded-md border bg-muted/20 px-3 py-2 text-xs"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate font-mono font-medium" title={p.url}>
-                        {p.url}
+            <div className="space-y-2">
+              {groupedProxies.map(([group, items]) => {
+                const collapsed = collapsedGroups.has(group)
+                return (
+                  <div key={group} className="rounded-md border">
+                    {/* Group header */}
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-muted/30 transition-colors"
+                      onClick={() => toggleGroup(group)}
+                    >
+                      {collapsed ? (
+                        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                      )}
+                      <span>{group}</span>
+                      <span className="text-muted-foreground font-normal">({items.length})</span>
+                      <span className="ml-auto text-muted-foreground font-normal">
+                        在线 {items.filter((p) => !p.dead && !p.disabled).length} /
+                        禁用 {items.filter((p) => p.disabled).length} /
+                        离线 {items.filter((p) => p.dead).length}
                       </span>
-                      {p.dead ? (
-                        <Badge variant="destructive" className="shrink-0">
-                          离线
-                        </Badge>
-                      ) : (
-                        <Badge variant="success" className="shrink-0">
-                          在线
-                        </Badge>
-                      )}
-                      {p.disabled && (
-                        <Badge variant="secondary" className="shrink-0">
-                          已禁用
-                        </Badge>
-                      )}
-                    </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-muted-foreground">
-                      {(p.region || p.country) && (
-                        <span>
-                          出口 {[p.region, p.country].filter(Boolean).join(', ')}
-                        </span>
-                      )}
-                      <span>绑定 {p.boundCredentials} 号</span>
-                      <span>并发 {p.maxConcurrency}</span>
-                      <span>可用 {p.availablePermits}</span>
-                      {p.consecutiveFailures > 0 && (
-                        <span className="text-destructive">
-                          连续失败 {p.consecutiveFailures}
-                        </span>
-                      )}
-                      {p.lastError && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span className="cursor-default text-destructive underline decoration-dotted">
-                              最近错误
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent side="top">{p.lastError}</TooltipContent>
-                        </Tooltip>
-                      )}
-                    </div>
+                    </button>
+
+                    {/* Proxy rows */}
+                    {!collapsed && (
+                      <div className="divide-y border-t">
+                        {items.map((p) => (
+                          <div
+                            key={p.id}
+                            className="flex items-center gap-3 bg-muted/10 px-3 py-2 text-xs"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <span className="truncate font-mono font-medium" title={p.url}>
+                                  {p.url}
+                                </span>
+                                {p.dead ? (
+                                  <Badge variant="destructive" className="shrink-0">
+                                    离线
+                                  </Badge>
+                                ) : (
+                                  <Badge variant="success" className="shrink-0">
+                                    在线
+                                  </Badge>
+                                )}
+                                {p.disabled && (
+                                  <Badge variant="secondary" className="shrink-0">
+                                    已禁用
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-muted-foreground">
+                                {p.country && (
+                                  <span>出口 {p.country}</span>
+                                )}
+                                <span>绑定 {p.boundCredentials} 号</span>
+                                <span>并发 {p.maxConcurrency}</span>
+                                <span>可用 {p.availablePermits}</span>
+                                {p.consecutiveFailures > 0 && (
+                                  <span className="text-destructive">
+                                    连续失败 {p.consecutiveFailures}
+                                  </span>
+                                )}
+                                {p.lastError && (
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="cursor-default text-destructive underline decoration-dotted">
+                                        最近错误
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top">{p.lastError}</TooltipContent>
+                                  </Tooltip>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2"
+                                onClick={() => handleTest(p.id)}
+                                disabled={testingId === p.id}
+                                title="测试连通性"
+                              >
+                                {testingId === p.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Wifi className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2"
+                                onClick={() => startEdit(p)}
+                                title="编辑"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-2 text-destructive hover:text-destructive"
+                                onClick={() => setDeleteTarget(p)}
+                                title="删除"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                  <div className="flex shrink-0 items-center gap-1">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 px-2"
-                      onClick={() => handleTest(p.id)}
-                      disabled={testingId === p.id}
-                      title="测试连通性"
-                    >
-                      {testingId === p.id ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Wifi className="h-3.5 w-3.5" />
-                      )}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 px-2"
-                      onClick={() => startEdit(p)}
-                      title="编辑"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 px-2 text-destructive hover:text-destructive"
-                      onClick={() => setDeleteTarget(p)}
-                      title="删除"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>

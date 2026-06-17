@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download, Network } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download, Network, BarChart3, Key } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -29,6 +29,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activePage, setActivePage] = useState<'accounts' | 'dashboard' | 'apikeys'>('accounts')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
@@ -792,6 +793,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </div>
           <div className="flex items-center gap-1">
+            {/* 页面导航 */}
+            <div className="mr-2 hidden items-center rounded-lg border bg-muted/40 p-0.5 sm:flex">
+              <Button
+                variant={activePage === 'accounts' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('accounts')}
+              >
+                <Server className="mr-1 h-3.5 w-3.5" />账号
+              </Button>
+              <Button
+                variant={activePage === 'dashboard' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('dashboard')}
+              >
+                <BarChart3 className="mr-1 h-3.5 w-3.5" />仪表盘
+              </Button>
+              <Button
+                variant={activePage === 'apikeys' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('apikeys')}
+              >
+                <Key className="mr-1 h-3.5 w-3.5" />API Key
+              </Button>
+            </div>
             <Button
               variant="ghost"
               size="icon"
@@ -830,6 +858,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="mx-auto w-full max-w-[2400px] px-4 sm:px-6 lg:px-8 2xl:px-10 py-6">
+        {activePage === 'dashboard' && <DashboardPanel />}
+        {activePage === 'apikeys' && <ApiKeysPanel />}
+        {activePage === 'accounts' && (<>
         {/* 工具栏：选择/批量/添加 */}
         <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-3">
@@ -1220,6 +1251,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             )}
           </>
         )}
+        {/* 账号列表 panel 关闭 */}
+        </>)}
       </main>
 
       {/* 余额对话框 */}
@@ -1291,6 +1324,287 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={proxyPoolDialogOpen}
         onOpenChange={setProxyPoolDialogOpen}
       />
+    </div>
+  )
+}
+
+// ============================================================
+// DashboardPanel — 仪表盘总览
+// ============================================================
+
+interface DashboardOverview {
+  requests1h: number
+  requests24h: number
+  successRate1h: number
+  successRate24h: number
+  avgLatencyMs1h: number
+  modelTop: Array<{ model: string; count: number }>
+}
+
+interface SeriesBucket {
+  ts: number
+  requests: number
+  errors: number
+  avgLatencyMs: number
+}
+
+function DashboardPanel() {
+  const [overview, setOverview] = useState<DashboardOverview | null>(null)
+  const [series, setSeries] = useState<SeriesBucket[]>([])
+  const [loading, setLoading] = useState(true)
+  const [window60, setWindow60] = useState(true)
+
+  const fetchData = async () => {
+    try {
+      const [ov, sr] = await Promise.all([
+        fetch('/api/admin/dashboard/overview', { headers: { 'Authorization': `Bearer ${storage.getApiKey()}` } }).then(r => r.json()),
+        fetch(`/api/admin/dashboard/series?window=${window60 ? 60 : 1440}&interval=${window60 ? 5 : 60}`, { headers: { 'Authorization': `Bearer ${storage.getApiKey()}` } }).then(r => r.json()),
+      ])
+      setOverview(ov)
+      setSeries(sr)
+    } catch (e) {
+      console.error('Dashboard fetch failed', e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { fetchData() }, [window60])
+
+  if (loading) return <div className="flex h-64 items-center justify-center text-muted-foreground">加载中...</div>
+
+  const fmtRate = (r: number) => `${(r * 100).toFixed(1)}%`
+  const rateColor = (r: number) => r >= 0.95 ? 'text-success' : r >= 0.8 ? 'text-yellow-500' : 'text-destructive'
+
+  const maxReq = Math.max(...series.map(b => b.requests), 1)
+
+  return (
+    <div className="space-y-6">
+      {/* KPI 卡片 */}
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">请求 (1h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.requests1h ?? 0}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">请求 (24h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.requests24h ?? 0}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">成功率 (1h)</div>
+          <div className={`mt-1 text-2xl font-bold tabular ${rateColor(overview?.successRate1h ?? 1)}`}>{fmtRate(overview?.successRate1h ?? 1)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">成功率 (24h)</div>
+          <div className={`mt-1 text-2xl font-bold tabular ${rateColor(overview?.successRate24h ?? 1)}`}>{fmtRate(overview?.successRate24h ?? 1)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">平均延迟 (1h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.avgLatencyMs1h ?? 0}<span className="ml-1 text-sm font-normal text-muted-foreground">ms</span></div>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        {/* 时序图（简易条形） */}
+        <Card className="col-span-2 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-sm font-semibold">请求量趋势</div>
+            <div className="flex items-center gap-1">
+              <Button size="sm" variant={window60 ? 'secondary' : 'ghost'} className="h-6 px-2 text-xs" onClick={() => setWindow60(true)}>1h</Button>
+              <Button size="sm" variant={!window60 ? 'secondary' : 'ghost'} className="h-6 px-2 text-xs" onClick={() => setWindow60(false)}>24h</Button>
+              <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => fetchData()}><RefreshCw className="h-3 w-3" /></Button>
+            </div>
+          </div>
+          {series.length === 0
+            ? <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">暂无数据</div>
+            : <div className="flex h-32 items-end gap-0.5">
+                {series.map((b, i) => {
+                  const h = Math.round((b.requests / maxReq) * 100)
+                  const errH = b.requests > 0 ? Math.round((b.errors / b.requests) * h) : 0
+                  const d = new Date(b.ts * 1000)
+                  const label = window60
+                    ? `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`
+                    : `${d.getHours().toString().padStart(2,'0')}h`
+                  return (
+                    <div key={i} className="group relative flex flex-1 flex-col items-center justify-end" title={`${label} 请求:${b.requests} 错误:${b.errors} 延迟:${b.avgLatencyMs}ms`}>
+                      <div className="w-full" style={{ height: `${h}%`, minHeight: b.requests > 0 ? '2px' : '0' }}>
+                        <div className="relative h-full w-full overflow-hidden rounded-sm bg-primary/40">
+                          {errH > 0 && <div className="absolute bottom-0 w-full rounded-sm bg-destructive/70" style={{ height: `${errH}%` }} />}
+                        </div>
+                      </div>
+                      {i % Math.ceil(series.length / 8) === 0 && (
+                        <div className="mt-0.5 text-[9px] text-muted-foreground">{label}</div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+          }
+          <div className="mt-2 flex gap-3 text-xs text-muted-foreground">
+            <span><span className="inline-block h-2 w-2 rounded-sm bg-primary/40 mr-1" />请求</span>
+            <span><span className="inline-block h-2 w-2 rounded-sm bg-destructive/70 mr-1" />错误</span>
+          </div>
+        </Card>
+
+        {/* 模型 Top10 */}
+        <Card className="p-4">
+          <div className="mb-3 text-sm font-semibold">模型 Top10 (1h)</div>
+          {!overview?.modelTop?.length
+            ? <div className="text-xs text-muted-foreground">暂无数据</div>
+            : <div className="space-y-2">
+                {overview.modelTop.map((m, i) => {
+                  const total = overview.modelTop.reduce((s, x) => s + x.count, 0)
+                  const pct = total > 0 ? (m.count / total) * 100 : 0
+                  return (
+                    <div key={i} className="space-y-0.5">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="truncate max-w-[160px]" title={m.model}>{m.model}</span>
+                        <span className="tabular text-muted-foreground">{m.count}</span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+          }
+        </Card>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// ApiKeysPanel — API Key 管理
+// ============================================================
+
+interface ApiKeyEntry {
+  id: number
+  key: string
+  group: string | null
+  label: string | null
+  created_at: string
+}
+
+function ApiKeysPanel() {
+  const [keys, setKeys] = useState<ApiKeyEntry[]>([])
+  const [loading, setLoading] = useState(true)
+  const [newKey, setNewKey] = useState('')
+  const [newGroup, setNewGroup] = useState('')
+  const [newLabel, setNewLabel] = useState('')
+  const [adding, setAdding] = useState(false)
+
+  const authHeader = { 'Authorization': `Bearer ${storage.getApiKey()}`, 'Content-Type': 'application/json' }
+
+  const fetchKeys = async () => {
+    try {
+      const r = await fetch('/api/admin/api-keys', { headers: authHeader })
+      const data = await r.json()
+      setKeys(data.keys ?? [])
+    } catch { /* ignore */ }
+    finally { setLoading(false) }
+  }
+
+  useEffect(() => { fetchKeys() }, [])
+
+  const handleAdd = async () => {
+    if (!newKey.trim()) return
+    setAdding(true)
+    try {
+      const r = await fetch('/api/admin/api-keys', {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({ key: newKey, group: newGroup || null, label: newLabel || null }),
+      })
+      if (r.ok) {
+        toast.success('API Key 已添加')
+        setNewKey(''); setNewGroup(''); setNewLabel('')
+        fetchKeys()
+      } else {
+        const e = await r.json().catch(() => ({}))
+        toast.error(e.message || '添加失败')
+      }
+    } finally { setAdding(false) }
+  }
+
+  const handleDelete = async (id: number) => {
+    try {
+      const r = await fetch(`/api/admin/api-keys/${id}`, { method: 'DELETE', headers: authHeader })
+      if (r.ok) { toast.success('已删除'); fetchKeys() }
+      else toast.error('删除失败')
+    } catch { toast.error('删除失败') }
+  }
+
+  if (loading) return <div className="flex h-64 items-center justify-center text-muted-foreground">加载中...</div>
+
+  return (
+    <div className="space-y-4 max-w-2xl">
+      <h2 className="text-lg font-semibold">API Key 管理</h2>
+      <p className="text-xs text-muted-foreground">配置多 API Key 及其分组路由。请求时在 Authorization 头中使用该 key；若配置了分组，请求将只从对应分组的账号中选号。</p>
+
+      {/* 添加表单 */}
+      <Card className="p-4 space-y-3">
+        <div className="text-sm font-medium">添加 Key</div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            placeholder="API Key *"
+            value={newKey}
+            onChange={e => setNewKey(e.target.value)}
+          />
+          <input
+            className="w-28 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            placeholder="分组 (可选)"
+            value={newGroup}
+            onChange={e => setNewGroup(e.target.value)}
+          />
+          <input
+            className="w-32 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            placeholder="备注 (可选)"
+            value={newLabel}
+            onChange={e => setNewLabel(e.target.value)}
+          />
+          <Button size="sm" onClick={handleAdd} disabled={adding || !newKey.trim()}>
+            <Plus className="mr-1 h-3.5 w-3.5" />{adding ? '添加中...' : '添加'}
+          </Button>
+        </div>
+      </Card>
+
+      {/* Key 列表 */}
+      {keys.length === 0
+        ? <div className="text-sm text-muted-foreground py-8 text-center">暂无 API Key，当前使用配置文件中的单 key 模式</div>
+        : <div className="rounded-md border overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="border-b bg-muted/40">
+                <tr>
+                  <th className="px-3 py-2 text-left font-medium">#</th>
+                  <th className="px-3 py-2 text-left font-medium">Key</th>
+                  <th className="px-3 py-2 text-left font-medium">分组</th>
+                  <th className="px-3 py-2 text-left font-medium">备注</th>
+                  <th className="px-3 py-2 text-left font-medium">创建时间</th>
+                  <th className="px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {keys.map((k, i) => (
+                  <tr key={k.id} className={i % 2 === 0 ? '' : 'bg-muted/20'}>
+                    <td className="px-3 py-2 text-muted-foreground">{k.id}</td>
+                    <td className="px-3 py-2 font-mono">{k.key.slice(0, 8)}…{k.key.slice(-4)}</td>
+                    <td className="px-3 py-2">{k.group ?? <span className="text-muted-foreground">—</span>}</td>
+                    <td className="px-3 py-2">{k.label ?? <span className="text-muted-foreground">—</span>}</td>
+                    <td className="px-3 py-2 text-muted-foreground">{new Date(k.created_at).toLocaleString()}</td>
+                    <td className="px-3 py-2">
+                      <Button size="sm" variant="ghost" className="h-6 px-1.5" onClick={() => handleDelete(k.id)} title="删除">
+                        <Trash2 className="h-3 w-3 text-destructive" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+      }
     </div>
   )
 }

@@ -238,10 +238,18 @@ async fn main() {
         config.truncation_recovery_system_notice,
     ));
 
+    // 共享多 API Key 列表（admin API 可运行时增删，鉴权即时生效）
+    let shared_api_keys: anthropic::middleware::SharedApiKeys =
+        Arc::new(RwLock::new(config.api_keys.clone()));
+
+    // 请求时序埋点（Dashboard 数据源，2000 条环形缓冲）
+    let shared_metrics: crate::admin::metrics::SharedMetrics =
+        Arc::new(crate::admin::metrics::MetricsStore::new(2000));
+
     // 构建 Anthropic API 路由（profile_arn 由首个凭据提供）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
-        config.api_keys.clone(),
+        shared_api_keys.clone(),
         Some(kiro_provider.clone()),
         first_credentials.profile_arn.clone(),
         config.extract_thinking,
@@ -250,6 +258,7 @@ async fn main() {
         prompt_runtime.clone(),
         prompt_cache_runtime.clone(),
         truncation_recovery_notice.clone(),
+        Some(shared_metrics.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -274,6 +283,9 @@ async fn main() {
                 truncation_recovery_notice.clone(),
                 endpoint_names.clone(),
                 proxy_manager.clone(),
+                shared_api_keys.clone(),
+                Some(std::path::PathBuf::from(&config_path)),
+                shared_metrics.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service, compression_config.clone());
 

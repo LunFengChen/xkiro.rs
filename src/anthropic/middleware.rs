@@ -16,6 +16,9 @@ use parking_lot::RwLock;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{ApiKeyEntry, CompressionConfig, PromptFilterConfig};
+
+/// 共享的多 API Key 列表（运行时可热更新；admin 写入即对鉴权生效）
+pub type SharedApiKeys = Arc<RwLock<Vec<ApiKeyEntry>>>;
 use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
 
 /// Request extension：鉴权时解析出的账号组（来自 api_keys 配置的 group 字段）
@@ -76,9 +79,9 @@ impl PromptCacheRuntime {
 pub struct AppState {
     /// API 密钥（单 key 兼容模式）
     pub api_key: String,
-    /// 多 API Key 配置（带可选分组）
+    /// 多 API Key 配置（带可选分组，共享可热更新）
     /// 非空时鉴权优先查此列表，空时回退到 api_key 单 key 模式
-    pub api_keys: Vec<ApiKeyEntry>,
+    pub api_keys: SharedApiKeys,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -96,6 +99,8 @@ pub struct AppState {
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
     /// 是否在 system prompt 末尾注入截断恢复识别说明（运行时可改）
     pub truncation_recovery_notice: Arc<AtomicBool>,
+    /// 请求时序埋点（Dashboard 数据源，None = 功能未启用）
+    pub metrics: Option<crate::admin::metrics::SharedMetrics>,
 }
 
 impl AppState {
@@ -108,7 +113,7 @@ impl AppState {
     ) -> Self {
         Self {
             api_key: api_key.into(),
-            api_keys: vec![],
+            api_keys: Arc::new(RwLock::new(vec![])),
             kiro_provider: None,
             extract_thinking,
             profile_arn: None,
@@ -123,6 +128,7 @@ impl AppState {
             })),
             prompt_cache_runtime,
             truncation_recovery_notice,
+            metrics: None,
         }
     }
 
@@ -157,6 +163,11 @@ impl AppState {
         self
     }
 
+    pub fn with_metrics(mut self, metrics: crate::admin::metrics::SharedMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub fn prompt_cache_snapshot(&self) -> PromptCacheSnapshot {
         self.prompt_cache_runtime.read().snapshot()
     }
@@ -181,14 +192,16 @@ pub async fn auth_middleware(
         return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
     };
 
-    if !state.api_keys.is_empty() {
+    if !state.api_keys.read().is_empty() {
         // 多 key 模式：查匹配，写入解析出的分组
-        if let Some(entry) = state
+        let matched = state
             .api_keys
+            .read()
             .iter()
             .find(|e| auth::constant_time_eq(&key, &e.key))
-        {
-            request.extensions_mut().insert(AuthGroup(entry.group.clone()));
+            .map(|e| e.group.clone());
+        if let Some(group) = matched {
+            request.extensions_mut().insert(AuthGroup(group));
             return next.run(request).await;
         }
         let error = ErrorResponse::authentication_error();

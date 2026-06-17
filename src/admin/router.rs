@@ -20,6 +20,8 @@ use super::{
         set_credential_region, set_credential_source, test_proxy,
         update_global_config, update_proxy, update_proxy_config, update_system_prompt,
         upsert_user_preset,
+        list_api_keys, create_api_key, delete_api_key,
+        dashboard_overview, dashboard_series,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -125,6 +127,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/config/user-presets", post(upsert_user_preset))
         .route("/config/user-presets/{id}", delete(delete_user_preset))
+        .route("/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api-keys/{id}", delete(delete_api_key))
+        .route("/dashboard/overview", get(dashboard_overview))
+        .route("/dashboard/series", get(dashboard_series))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

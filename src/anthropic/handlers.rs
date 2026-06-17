@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 
+use chrono::Utc as ChronoUtc;
 use crate::kiro::model::events::{Event, MeteringEvent};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -1118,7 +1119,8 @@ pub async fn post_messages(
     });
 
     if payload.stream {
-        // 流式响应
+        // 流式响应（latency 在流传输中累积，此处记为 0，仍计入请求数）
+        let t0 = std::time::Instant::now();
         let stream_request = StreamRequestContext {
             cache_tracker: prompt_cache
                 .accounting_enabled
@@ -1132,9 +1134,22 @@ pub async fn post_messages(
             user_id,
             group,
         };
-        handle_stream_request(provider, stream_request).await
+        let resp = handle_stream_request(provider, stream_request).await;
+        if let Some(m) = &state.metrics {
+            m.record(crate::admin::metrics::RequestEvent {
+                ts: ChronoUtc::now().timestamp(),
+                cred_id: None,
+                model: payload.model.clone(),
+                latency_ms: t0.elapsed().as_millis() as u64,
+                input_tokens: input_tokens as u64,
+                output_tokens: 0,
+                success: resp.status().is_success(),
+            });
+        }
+        resp
     } else {
         // 非流式响应
+        let t0 = std::time::Instant::now();
         let non_stream_request = NonStreamRequestContext {
             request_body: &request_body,
             model: &payload.model,
@@ -1148,7 +1163,19 @@ pub async fn post_messages(
             cache_profile: cache_profile.as_ref(),
             group,
         };
-        handle_non_stream_request(provider, non_stream_request).await
+        let resp = handle_non_stream_request(provider, non_stream_request).await;
+        if let Some(m) = &state.metrics {
+            m.record(crate::admin::metrics::RequestEvent {
+                ts: ChronoUtc::now().timestamp(),
+                cred_id: None,
+                model: payload.model.clone(),
+                latency_ms: t0.elapsed().as_millis() as u64,
+                input_tokens: input_tokens as u64,
+                output_tokens: 0,
+                success: resp.status().is_success(),
+            });
+        }
+        resp
     }
 }
 
