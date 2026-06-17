@@ -2962,11 +2962,30 @@ struct ProxyGeo {
 ///   1. 冒号分隔 `ip:port[:user:pass]` —— 无 scheme,默认补 `socks5://`
 ///   2. 逗号分隔 `url[,user[,pass]]` —— url 自带 scheme(http/https/socks5(h))
 /// 识别规则:含 `://` 或含 `,` → 走逗号格式;否则按冒号格式拆。
+/// 规范化 scheme 拼写（常见拼写错误 → 标准形式）
+fn normalize_proxy_scheme(url: &str) -> String {
+    // sock5 → socks5、sock4 → socks4、sock → socks5
+    let lower = url.to_lowercase();
+    if lower.starts_with("sock5://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    if lower.starts_with("sock4://") {
+        return format!("socks4://{}", &url[7..]);
+    }
+    if lower.starts_with("sock://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    url.to_string()
+}
+
 fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String>), String> {
-    let line = line.trim();
-    // 逗号格式(原有):显式 url[,user[,pass]]
-    if line.contains("://") || line.contains(',') {
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+    // 规范化 scheme（容忍 sock5/sock4/sock 拼写错误）
+    let normalized = normalize_proxy_scheme(line.trim());
+    let line = normalized.as_str();
+
+    // ① 逗号分隔:url,user,pass  或  url,user  或  url（逗号内的 url 可以包含 ://）
+    if line.contains(',') {
+        let parts: Vec<&str> = line.splitn(3, ',').map(|s| s.trim()).collect();
         let url = parts[0].to_string();
         if url.is_empty() {
             return Err("url 为空".to_string());
@@ -2975,27 +2994,69 @@ fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String
         let password = parts.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
         return Ok((url, username, password));
     }
-    // 冒号格式:ip:port 或 ip:port:user:pass,默认 socks5://
-    let parts: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
-    match parts.as_slice() {
-        [ip, port] => {
-            if ip.is_empty() || port.is_empty() {
-                return Err(format!("冒号格式需 ip:port,得到: {}", line));
-            }
-            Ok((format!("socks5://{}:{}", ip, port), None, None))
+
+    // ② 包含 :// — URL 格式，再判断 authority 里是否藏了 user:pass
+    if let Some(after_scheme) = line.find("://").map(|i| (i, &line[i + 3..])) {
+        let (scheme_end, authority) = after_scheme;
+        let scheme = &line[..scheme_end]; // socks5 / http / https / socks4 …
+
+        // 去掉 authority 中可能有的 path/query 部分
+        let authority = authority.split('/').next().unwrap_or(authority);
+
+        // 检查是否已包含 @ (标准格式 scheme://user:pass@host:port)
+        if authority.contains('@') {
+            // 标准 URL，直接用原串
+            return Ok((line.to_string(), None, None));
         }
-        [ip, port, user, pass] => {
-            if ip.is_empty() || port.is_empty() {
-                return Err(format!("冒号格式需 ip:port:user:pass,得到: {}", line));
+
+        // 尝试解析 host:port:user:pass（authority 段有 3 个冒号 → 4 段）
+        let colon_parts: Vec<&str> = authority.split(':').collect();
+        match colon_parts.as_slice() {
+            [host, port] => {
+                // scheme://host:port — 正常两段，无 auth
+                if host.is_empty() || port.is_empty() {
+                    return Err(format!("无效的代理地址: {}", line));
+                }
+                Ok((line.to_string(), None, None))
             }
-            let username = (!user.is_empty()).then(|| user.to_string());
-            let password = (!pass.is_empty()).then(|| pass.to_string());
-            Ok((format!("socks5://{}:{}", ip, port), username, password))
+            [host, port, user, pass] => {
+                // scheme://host:port:user:pass — user/pass 跟在端口后，重组为标准 URL
+                if host.is_empty() || port.is_empty() {
+                    return Err(format!("无效的代理地址: {}", line));
+                }
+                let username = (!user.is_empty()).then(|| user.to_string());
+                let password = (!pass.is_empty()).then(|| pass.to_string());
+                let clean_url = format!("{}://{}:{}", scheme, host, port);
+                Ok((clean_url, username, password))
+            }
+            _ => Err(format!(
+                "无法识别的代理格式(authority 段应为 host:port 或 host:port:user:pass): {}",
+                line
+            )),
         }
-        _ => Err(format!(
-            "无法识别的代理格式(支持 ip:port[:user:pass] 或 url[,user,pass]): {}",
-            line
-        )),
+    } else {
+        // ③ 纯冒号格式(无 ://): ip:port 或 ip:port:user:pass，默认 socks5://
+        let parts: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
+        match parts.as_slice() {
+            [ip, port] => {
+                if ip.is_empty() || port.is_empty() {
+                    return Err(format!("冒号格式需 ip:port，得到: {}", line));
+                }
+                Ok((format!("socks5://{}:{}", ip, port), None, None))
+            }
+            [ip, port, user, pass] => {
+                if ip.is_empty() || port.is_empty() {
+                    return Err(format!("冒号格式需 ip:port:user:pass，得到: {}", line));
+                }
+                let username = (!user.is_empty()).then(|| user.to_string());
+                let password = (!pass.is_empty()).then(|| pass.to_string());
+                Ok((format!("socks5://{}:{}", ip, port), username, password))
+            }
+            _ => Err(format!(
+                "无法识别的代理格式(支持 ip:port[:user:pass] / scheme://host:port[:user:pass] / url,user,pass): {}",
+                line
+            )),
+        }
     }
 }
 
