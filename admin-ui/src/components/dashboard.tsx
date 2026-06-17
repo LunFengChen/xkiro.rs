@@ -54,7 +54,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchQueryBalanceProgress, setBatchQueryBalanceProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 12
+  const [itemsPerPage, setItemsPerPage] = useState(() => {
+    try {
+      const v = parseInt(localStorage.getItem('kiro-page-size') || '', 10)
+      return [12, 24, 48, 96, 200].includes(v) ? v : 12
+    } catch { return 12 }
+  })
   const [compactMode, setCompactMode] = useState(() => {
     try { return localStorage.getItem('kiro-compact-mode') === '1' } catch { return false }
   })
@@ -113,6 +118,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  // 每页条数持久化 + 改变时回到第一页
+  const handlePageSizeChange = (size: number) => {
+    setItemsPerPage(size)
+    setCurrentPage(1)
+    try { localStorage.setItem('kiro-page-size', String(size)) } catch { /* ignore */ }
+  }
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -1039,9 +1051,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <span className="w-44 shrink-0">邮箱</span>
                   <span className="w-20 shrink-0">来源</span>
                   <span className="w-24 shrink-0">订阅</span>
-                  <span className="flex-1 min-w-[160px]">配额</span>
+                  <span className="flex-1 min-w-[220px]">配额 / 超额</span>
                   <span className="w-16 shrink-0 text-center">状态</span>
-                  <span className="w-28 shrink-0">过期 / 试用</span>
+                  <span className="w-28 shrink-0">配额重置</span>
                   <span className="w-20 shrink-0">分组</span>
                 </div>
                 {/* 行 */}
@@ -1087,10 +1099,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                             ? <span className="inline-block px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-medium truncate max-w-full" title={sub}>{sub}</span>
                             : <span className="text-muted-foreground/40">—</span>}
                         </div>
-                        {/* 配额：主条 + 超额条 */}
-                        <div className="flex-1 min-w-[160px] flex flex-col gap-1">
-                          <div className="flex items-center gap-2">
-                            <span className="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+                        {/* 配额：主条 + 超额条 并排 */}
+                        <div className="flex-1 min-w-[220px] flex items-center gap-3">
+                          {/* 主配额 */}
+                          <div className="flex-1 flex items-center gap-2">
+                            <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
                               {limit > 0 ? <><span className="text-foreground font-medium">{Math.round(baseRemaining)}</span>/{limit}</> : '—'}
                             </span>
                             <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
@@ -1100,9 +1113,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                               />
                             </div>
                           </div>
-                          {(overCap > 0 || overageOn) && (
-                            <div className="flex items-center gap-2">
-                              <span className="w-20 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
+                          {/* 超额 */}
+                          {(overCap > 0 || overageOn) ? (
+                            <div className="flex-1 flex items-center gap-2">
+                              <span className="w-16 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
                                 ⚡{overCap > 0 ? <><span className="font-medium">{Math.round(overRemaining)}</span>/{overCap}</> : '已开'}
                               </span>
                               <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
@@ -1112,6 +1126,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                                 />
                               </div>
                             </div>
+                          ) : (
+                            <div className="flex-1 text-muted-foreground/30 text-center">—</div>
                           )}
                         </div>
                         {/* 状态 */}
@@ -1120,10 +1136,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                             ? <span className="inline-block px-1.5 py-0.5 rounded bg-destructive/15 text-destructive">禁用</span>
                             : <span className="inline-block px-1.5 py-0.5 rounded bg-green-500/15 text-green-600 dark:text-green-500">正常</span>}
                         </div>
-                        {/* 过期 / 试用 */}
-                        <div className="w-28 shrink-0 tabular-nums text-muted-foreground truncate" title={credential.expiresAt || ''}>
-                          {credential.expiresAt
-                            ? new Date(credential.expiresAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                        {/* 配额重置时间（来自余额 nextResetAt，非 token 刷新时间） */}
+                        <div className="w-28 shrink-0 tabular-nums text-muted-foreground truncate" title={bal?.nextResetAt ? new Date(bal.nextResetAt * 1000).toLocaleString('zh-CN') : ''}>
+                          {bal?.nextResetAt
+                            ? new Date(bal.nextResetAt * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
                             : '—'}
                         </div>
                         {/* 分组 */}
@@ -1163,9 +1179,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             )}
 
-            {/* 分页控件 */}
-            {totalPages > 1 && (
-              <div className="mt-6 flex items-center justify-center gap-3 text-sm">
+            {/* 分页控件 + 每页条数 */}
+            {filteredCredentials.length > 0 && (
+              <div className="mt-6 flex items-center justify-center gap-3 text-sm flex-wrap">
                 <Button
                   variant="outline"
                   size="sm"
@@ -1176,17 +1192,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   上一页
                 </Button>
                 <span className="tabular text-muted-foreground">
-                  {currentPage} / {totalPages} · 共 {data?.credentials.length} 个
+                  {currentPage} / {Math.max(1, totalPages)} · 共 {filteredCredentials.length} 个
                 </span>
                 <Button
                   variant="outline"
                   size="sm"
                   className="h-8"
                   onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                  disabled={currentPage === totalPages}
+                  disabled={currentPage >= totalPages}
                 >
                   下一页
                 </Button>
+                <div className="flex items-center gap-1.5 ml-2">
+                  <span className="text-muted-foreground">每页</span>
+                  <select
+                    value={itemsPerPage}
+                    onChange={(e) => handlePageSizeChange(Number(e.target.value))}
+                    className="h-8 rounded-md border border-border bg-background px-2 text-sm cursor-pointer focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    {[12, 24, 48, 96, 200].map(n => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                  <span className="text-muted-foreground">条</span>
+                </div>
               </div>
             )}
           </>
