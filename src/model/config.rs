@@ -195,6 +195,25 @@ pub struct PromptFilterRule {
     pub replace: String,
 }
 
+/// 带分组的 API Key 配置项
+///
+/// 配置示例（config.json）：
+/// ```json
+/// "apiKeys": [
+///   { "key": "sk-admin-xxx", "group": "admin" },
+///   { "key": "sk-public-yyy" }
+/// ]
+/// ```
+/// group 为空或未配置时，该 key 可访问所有无分组账号；
+/// group 有值时，仅能调用 `KiroCredentials.group == Some(group)` 的账号。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyEntry {
+    pub key: String,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,6 +245,13 @@ pub struct Config {
 
     #[serde(default)]
     pub api_key: Option<String>,
+
+    /// 多 API Key 配置（带可选分组）
+    ///
+    /// 与 `api_key` 二选一或并存。鉴权时优先查 `api_keys` 列表，
+    /// 若 `api_keys` 为空则回退到 `api_key` 单 key 兼容模式。
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyEntry>,
 
     #[serde(default = "default_system_version")]
     pub system_version: String,
@@ -478,7 +504,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
-            system_version: default_system_version(),
+            api_keys: vec![],
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
             count_tokens_api_url: None,
@@ -511,6 +537,7 @@ impl Default for Config {
             truncation_recovery_system_notice: true,
             precise_token_counting: false,
             config_path: None,
+            system_version: default_system_version(),
         }
     }
 }

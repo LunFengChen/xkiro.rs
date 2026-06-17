@@ -11,6 +11,9 @@ import {
   setOverageStatus,
   addCredential,
   deleteCredential,
+  setCredentialGroup,
+  setCredentialSource,
+  disableCredentialsBatch,
 } from '@/api/credentials'
 import { usePageActive } from '@/hooks/use-page-active'
 import type { AddCredentialRequest } from '@/types/api'
@@ -139,6 +142,42 @@ export function useDeleteCredential() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置账号分组
+export function useSetGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, group }: { id: number; group: string | null }) =>
+      setCredentialGroup(id, group),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置账号来源渠道
+export function useSetSource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, source }: { id: number; source: string | null }) =>
+      setCredentialSource(id, source),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量禁用/启用
+export function useDisableBatch() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ ids, disabled }: { ids: number[]; disabled: boolean }) =>
+      disableCredentialsBatch(ids, disabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

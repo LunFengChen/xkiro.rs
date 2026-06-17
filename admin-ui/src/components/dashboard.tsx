@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download, Network } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, Settings, ZoomIn, FileText, Download, Network, BarChart3, Key } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,11 +12,13 @@ import { ModelsDialog } from '@/components/models-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { ImportJobToast } from '@/components/import-job-toast'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useDisableBatch } from '@/hooks/use-credentials'
+import { useProxies } from '@/hooks/use-proxies'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
 import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam, deleteCredentialsBatch } from '@/api/credentials'
@@ -28,12 +30,14 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activePage, setActivePage] = useState<'accounts' | 'dashboard' | 'apikeys'>('accounts')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [activeImportJob, setActiveImportJob] = useState<{ jobId: string; total: number } | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
@@ -52,7 +56,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchQueryBalanceProgress, setBatchQueryBalanceProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 12
+  const [itemsPerPage, setItemsPerPage] = useState(() => {
+    try {
+      const v = parseInt(localStorage.getItem('kiro-page-size') || '', 10)
+      return [12, 24, 48, 96, 200].includes(v) ? v : 12
+    } catch { return 12 }
+  })
   const [compactMode, setCompactMode] = useState(() => {
     try { return localStorage.getItem('kiro-compact-mode') === '1' } catch { return false }
   })
@@ -72,14 +81,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
+  const { mutateAsync: disableBatch } = useDisableBatch()
   const { data: runtimeMap } = useRuntimeStats()
+  const { data: proxyData } = useProxies()
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  // 按组/渠道过滤
+  const [filterGroup, setFilterGroup] = useState<string>('')
+  const [filterSource, setFilterSource] = useState<string>('')
+
+  // 计算分页（含 group/source 过滤）
+  const allCredentials = data?.credentials || []
+  const filteredCredentials = allCredentials.filter(c => {
+    if (filterGroup && (c.group ?? '') !== filterGroup) return false
+    if (filterSource && (c.source ?? '') !== filterSource) return false
+    return true
+  })
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   // 切片后逐元素 merge runtimeMap 的实时字段（K/N + lastUsedAt + disabled）
-  const currentCredentials = (data?.credentials.slice(startIndex, endIndex) || []).map(credential => {
+  const currentCredentials = filteredCredentials.slice(startIndex, endIndex).map(credential => {
     const runtime = runtimeMap?.get(credential.id)
     if (!runtime) return credential
     return {
@@ -90,12 +111,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
       disabled: runtime.disabled,
     }
   })
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const disabledCredentialCount = allCredentials.filter(credential => credential.disabled).length || 0
+
+  // 所有不重复的 group / source 值（用于过滤下拉）
+  const allGroups = [...new Set(allCredentials.map(c => c.group).filter(Boolean) as string[])].sort()
+  const allSources = [...new Set(allCredentials.map(c => c.source).filter(Boolean) as string[])].sort()
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  // 每页条数持久化 + 改变时回到第一页
+  const handlePageSizeChange = (size: number) => {
+    setItemsPerPage(size)
+    setCurrentPage(1)
+    try { localStorage.setItem('kiro-page-size', String(size)) } catch { /* ignore */ }
+  }
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -281,6 +313,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
       toast.error(`批量删除失败: ${extractErrorMessage(err)}`)
     }
 
+    deselectAll()
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  }
+
+  // 批量禁用 / 批量启用
+  const handleBatchDisable = async (disabled: boolean) => {
+    if (selectedIds.size === 0) {
+      toast.error(`请先选择凭据`)
+      return
+    }
+    const ids = Array.from(selectedIds)
+    const label = disabled ? '禁用' : '启用'
+    try {
+      const res = await disableBatch({ ids, disabled })
+      if (res.failureCount === 0) {
+        toast.success(`成功${label} ${res.successCount} 个凭据`)
+      } else {
+        toast.warning(`${label}：成功 ${res.successCount}，失败 ${res.failureCount}`)
+      }
+    } catch (err) {
+      toast.error(`批量${label}失败: ${extractErrorMessage(err)}`)
+    }
     deselectAll()
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
   }
@@ -741,6 +795,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </div>
           <div className="flex items-center gap-1">
+            {/* 页面导航 */}
+            <div className="mr-2 hidden items-center rounded-lg border bg-muted/40 p-0.5 sm:flex">
+              <Button
+                variant={activePage === 'accounts' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('accounts')}
+              >
+                <Server className="mr-1 h-3.5 w-3.5" />账号
+              </Button>
+              <Button
+                variant={activePage === 'dashboard' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('dashboard')}
+              >
+                <BarChart3 className="mr-1 h-3.5 w-3.5" />仪表盘
+              </Button>
+              <Button
+                variant={activePage === 'apikeys' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActivePage('apikeys')}
+              >
+                <Key className="mr-1 h-3.5 w-3.5" />API Key
+              </Button>
+            </div>
             <Button
               variant="ghost"
               size="icon"
@@ -779,6 +860,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="mx-auto w-full max-w-[2400px] px-4 sm:px-6 lg:px-8 2xl:px-10 py-6">
+        {activePage === 'dashboard' && <DashboardPanel />}
+        {activePage === 'apikeys' && <ApiKeysPanel />}
+        {activePage === 'accounts' && (<>
         {/* 工具栏：选择/批量/添加 */}
         <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center gap-3">
@@ -844,6 +928,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   批量删除
                 </Button>
+                <Button
+                  onClick={() => handleBatchDisable(true)}
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  disabled={selectedIds.size === 0}
+                  title={`禁用选中的 ${selectedIds.size} 个凭据`}
+                >
+                  批量禁用
+                </Button>
+                <Button
+                  onClick={() => handleBatchDisable(false)}
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  disabled={selectedIds.size === 0}
+                  title={`启用选中的 ${selectedIds.size} 个凭据`}
+                >
+                  批量启用
+                </Button>
                 <span className="mx-1 h-6 w-px self-center bg-border" />
               </>
             )}
@@ -907,6 +1011,62 @@ export function Dashboard({ onLogout }: DashboardProps) {
         </div>
 
         {/* 凭据列表 */}
+        {/* 分组 / 渠道快速过滤卡片 */}
+        {(allGroups.length > 0 || allSources.length > 0) && (
+          <div className="mb-3 flex flex-wrap gap-2 items-center">
+            {allSources.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-xs text-muted-foreground mr-1">渠道:</span>
+                <button
+                  onClick={() => { setFilterSource(''); setCurrentPage(1) }}
+                  className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterSource === '' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-border hover:bg-muted'}`}
+                >
+                  全部 ({allCredentials.length})
+                </button>
+                {allSources.map(src => {
+                  const cnt = allCredentials.filter(c => c.source === src).length
+                  const activeCnt = allCredentials.filter(c => c.source === src && !c.disabled).length
+                  return (
+                    <button
+                      key={src}
+                      onClick={() => { setFilterSource(src); setCurrentPage(1) }}
+                      className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterSource === src ? 'bg-purple-500 text-white border-purple-500' : 'bg-background border-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950 text-purple-700 dark:text-purple-400'}`}
+                      title={`存活: ${activeCnt}/${cnt}`}
+                    >
+                      {src} ({activeCnt}/{cnt})
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            {allGroups.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-xs text-muted-foreground mr-1">分组:</span>
+                <button
+                  onClick={() => { setFilterGroup(''); setCurrentPage(1) }}
+                  className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterGroup === '' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-border hover:bg-muted'}`}
+                >
+                  全部
+                </button>
+                {allGroups.map(grp => {
+                  const cnt = allCredentials.filter(c => c.group === grp).length
+                  const activeCnt = allCredentials.filter(c => c.group === grp && !c.disabled).length
+                  return (
+                    <button
+                      key={grp}
+                      onClick={() => { setFilterGroup(grp); setCurrentPage(1) }}
+                      className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterGroup === grp ? 'bg-blue-500 text-white border-blue-500' : 'bg-background border-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950 text-blue-700 dark:text-blue-400'}`}
+                      title={`存活: ${activeCnt}/${cnt}`}
+                    >
+                      {grp} ({activeCnt}/{cnt})
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {data?.credentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center text-sm text-muted-foreground">
@@ -916,61 +1076,130 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
             {compactMode ? (
-              /* 紧凑视图：每号一行，仅显示标题 + 双进度条 */
-              <div className="flex flex-col gap-1">
-                {currentCredentials.map((credential) => {
-                  const bal = balanceMap.get(credential.id) || null
-                  const limit = bal?.usageLimit ?? 0
-                  const used = bal?.currentUsage ?? 0
-                  const baseRemaining = Math.max(0, limit - used)
-                  const basePercent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
-                  const overCap = bal?.overageCap ?? 0
-                  const overUsed = Math.max(0, used - limit)
-                  const overRemaining = Math.max(0, overCap - overUsed)
-                  const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
-                  const disabled = credential.disabled
-                  const label = credential.email
-                    ? credential.email.split('@')[0]
-                    : `#${credential.id}`
-                  return (
-                    <div
-                      key={credential.id}
-                      className={`flex items-center gap-2 px-2 py-1 rounded border text-xs ${disabled ? 'opacity-50' : ''} ${selectedIds.has(credential.id) ? 'border-primary bg-primary/5' : 'border-border'}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.has(credential.id)}
-                        onChange={() => toggleSelect(credential.id)}
-                        className="h-3.5 w-3.5 shrink-0 cursor-pointer"
-                      />
-                      <span className="w-28 shrink-0 truncate font-mono text-muted-foreground" title={credential.email || String(credential.id)}>
-                        {label}
-                      </span>
-                      <div className="flex-1 flex flex-col gap-0.5">
-                        <div className="flex items-center gap-1">
-                          <span className="w-8 text-right tabular-nums text-muted-foreground">{limit > 0 ? Math.round(baseRemaining) : '—'}</span>
-                          <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
-                            <div
-                              className={`h-full rounded-full transition-all ${basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-yellow-500' : 'bg-primary'}`}
-                              style={{ width: `${basePercent}%` }}
-                            />
-                          </div>
+              /* 紧凑视图：KAM 风格表格 — 邮箱/来源/订阅/配额(主+超额双条)/状态/过期/分组 */
+              <div className="rounded-lg border border-border overflow-hidden">
+                {/* 表头 */}
+                <div className="flex items-center gap-2 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
+                  <span className="w-4 shrink-0" />
+                  <span className="w-44 shrink-0">邮箱</span>
+                  <span className="w-20 shrink-0">来源</span>
+                  <span className="w-24 shrink-0">订阅</span>
+                  <span className="flex-1 min-w-[160px]">配额 / 超额</span>
+                  <span className="w-16 shrink-0 text-center">状态</span>
+                  <span className="w-28 shrink-0">配额重置</span>
+                  <span className="w-20 shrink-0">分组</span>
+                  <span className="w-28 shrink-0">代理</span>
+                </div>
+                {/* 行 */}
+                <div className="divide-y divide-border">
+                  {currentCredentials.map((credential) => {
+                    const bal = balanceMap.get(credential.id) || null
+                    const limit = bal?.usageLimit ?? 0
+                    const used = bal?.currentUsage ?? 0
+                    const baseRemaining = Math.max(0, limit - used)
+                    const basePercent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
+                    const overCap = bal?.overageCap ?? 0
+                    const overUsed = Math.max(0, used - limit)
+                    const overRemaining = Math.max(0, overCap - overUsed)
+                    const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
+                    const overageOn = bal?.overageStatus === 'ENABLED'
+                    const disabled = credential.disabled
+                    const label = credential.email || `#${credential.id}`
+                    const sub = bal?.subscriptionTitle || null
+                    return (
+                      <div
+                        key={credential.id}
+                        className={`flex items-center gap-2 px-3 py-2 text-xs transition-colors ${disabled ? 'opacity-50' : ''} ${selectedIds.has(credential.id) ? 'bg-primary/5' : 'hover:bg-muted/30'}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(credential.id)}
+                          onChange={() => toggleSelect(credential.id)}
+                          className="h-3.5 w-3.5 shrink-0 cursor-pointer"
+                        />
+                        {/* 邮箱 + 标签 */}
+                        <div className="w-44 shrink-0 min-w-0">
+                          <div className="truncate font-mono text-foreground" title={credential.email || String(credential.id)}>{label}</div>
                         </div>
-                        {(overCap > 0 || overUsed > 0) && (
-                          <div className="flex items-center gap-1">
-                            <span className="w-8 text-right tabular-nums text-muted-foreground">{overCap > 0 ? Math.round(overRemaining) : '—'}</span>
-                            <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
+                        {/* 来源 */}
+                        <div className="w-20 shrink-0">
+                          {credential.source
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-secondary text-muted-foreground truncate max-w-full" title={credential.source}>{credential.source}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 订阅 */}
+                        <div className="w-24 shrink-0">
+                          {sub
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-medium truncate max-w-full" title={sub}>{sub}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 配额：主条 + 超额条 上下叠放 */}
+                        <div className="flex-1 min-w-[160px] flex flex-col gap-1">
+                          {/* 主配额 */}
+                          <div className="flex items-center gap-2">
+                            <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground text-2xs">
+                              {limit > 0 ? <><span className="text-foreground font-medium">{Math.round(baseRemaining)}</span>/{limit}</> : '—'}
+                            </span>
+                            <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
                               <div
-                                className={`h-full rounded-full transition-all ${overPercent >= 90 ? 'bg-destructive' : 'bg-yellow-500'}`}
-                                style={{ width: `${overPercent}%` }}
+                                className={`h-full rounded-full transition-all ${basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                                style={{ width: `${basePercent}%` }}
                               />
                             </div>
                           </div>
-                        )}
+                          {/* 超额 */}
+                          {(overCap > 0 || overageOn) ? (
+                            <div className="flex items-center gap-2">
+                              <span className="w-16 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 text-2xs flex items-center justify-end gap-0.5">
+                                ⚡{overCap > 0 ? <><span className="font-medium">{Math.round(overRemaining)}</span>/{overCap}</> : '已开'}
+                              </span>
+                              <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all ${overPercent >= 90 ? 'bg-destructive' : 'bg-yellow-500'}`}
+                                  style={{ width: `${overPercent}%` }}
+                                />
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                        {/* 状态 */}
+                        <div className="w-16 shrink-0 text-center">
+                          {disabled
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-destructive/15 text-destructive">禁用</span>
+                            : <span className="inline-block px-1.5 py-0.5 rounded bg-green-500/15 text-green-600 dark:text-green-500">正常</span>}
+                        </div>
+                        {/* 配额重置时间（来自余额 nextResetAt，非 token 刷新时间） */}
+                        <div className="w-28 shrink-0 tabular-nums text-muted-foreground truncate" title={bal?.nextResetAt ? new Date(bal.nextResetAt * 1000).toLocaleString('zh-CN') : ''}>
+                          {bal?.nextResetAt
+                            ? new Date(bal.nextResetAt * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                            : '—'}
+                        </div>
+                        {/* 分组 */}
+                        <div className="w-20 shrink-0">
+                          {credential.group
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-500 truncate max-w-full" title={credential.group}>{credential.group}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 代理 */}
+                        <div className="w-28 shrink-0">
+                          {(() => {
+                            const bp = proxyData?.proxies.find((p) => p.id === credential.proxyId)
+                            if (!bp) return <span className="text-muted-foreground/40">—</span>
+                            const label = (bp.region ? `${bp.region} · ` : '') + bp.url.replace(/^https?:\/\//, '').replace(/^socks5?:\/\//, '')
+                            return (
+                              <span
+                                className={`inline-block truncate max-w-full px-1.5 py-0.5 rounded font-mono text-2xs ${bp.dead ? 'bg-destructive/15 text-destructive' : 'bg-muted text-muted-foreground'}`}
+                                title={bp.url}
+                              >
+                                {label}
+                              </span>
+                            )
+                          })()}
+                        </div>
                       </div>
-                    </div>
-                  )
-                })}
+                    )
+                  })}
+                </div>
               </div>
             ) : (
               /* 详细视图：原卡片网格 */
@@ -998,9 +1227,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             )}
 
-            {/* 分页控件 */}
-            {totalPages > 1 && (
-              <div className="mt-6 flex items-center justify-center gap-3 text-sm">
+            {/* 分页控件 + 每页条数 */}
+            {filteredCredentials.length > 0 && (
+              <div className="mt-6 flex items-center justify-center gap-3 text-sm flex-wrap">
                 <Button
                   variant="outline"
                   size="sm"
@@ -1011,21 +1240,36 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   上一页
                 </Button>
                 <span className="tabular text-muted-foreground">
-                  {currentPage} / {totalPages} · 共 {data?.credentials.length} 个
+                  {currentPage} / {Math.max(1, totalPages)} · 共 {filteredCredentials.length} 个
                 </span>
                 <Button
                   variant="outline"
                   size="sm"
                   className="h-8"
                   onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                  disabled={currentPage === totalPages}
+                  disabled={currentPage >= totalPages}
                 >
                   下一页
                 </Button>
+                <div className="flex items-center gap-1.5 ml-2">
+                  <span className="text-muted-foreground">每页</span>
+                  <select
+                    value={itemsPerPage}
+                    onChange={(e) => handlePageSizeChange(Number(e.target.value))}
+                    className="h-8 rounded-md border border-border bg-background px-2 text-sm cursor-pointer focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    {[12, 24, 48, 96, 200].map(n => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                  <span className="text-muted-foreground">条</span>
+                </div>
               </div>
             )}
           </>
         )}
+        {/* 账号列表 panel 关闭 */}
+        </>)}
       </main>
 
       {/* 余额对话框 */}
@@ -1058,7 +1302,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+        onJobStart={(jobId, total) => setActiveImportJob({ jobId, total })}
       />
+
+      {/* KAM 后台导入进度浮窗 */}
+      {activeImportJob && (
+        <ImportJobToast
+          jobId={activeImportJob.jobId}
+          total={activeImportJob.total}
+          onDone={() => setActiveImportJob(null)}
+        />
+      )}
 
       {/* 批量验活对话框 */}
       <BatchVerifyDialog
@@ -1087,6 +1341,272 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={proxyPoolDialogOpen}
         onOpenChange={setProxyPoolDialogOpen}
       />
+    </div>
+  )
+}
+
+// ============================================================
+// DashboardPanel — 仪表盘总览
+// ============================================================
+
+interface DashboardOverview {
+  requests1h: number
+  requests24h: number
+  successRate1h: number
+  successRate24h: number
+  avgLatencyMs1h: number
+  modelTop: Array<{ model: string; count: number }>
+}
+
+interface SeriesBucket {
+  ts: number
+  requests: number
+  errors: number
+  avgLatencyMs: number
+}
+
+function DashboardPanel() {
+  const [overview, setOverview] = useState<DashboardOverview | null>(null)
+  const [series, setSeries] = useState<SeriesBucket[]>([])
+  const [loading, setLoading] = useState(true)
+  const [window60, setWindow60] = useState(true)
+
+  const fetchData = async () => {
+    try {
+      const [ov, sr] = await Promise.all([
+        fetch('/api/admin/dashboard/overview', { headers: { 'Authorization': `Bearer ${storage.getApiKey()}` } }).then(r => r.json()),
+        fetch(`/api/admin/dashboard/series?window=${window60 ? 60 : 1440}&interval=${window60 ? 5 : 60}`, { headers: { 'Authorization': `Bearer ${storage.getApiKey()}` } }).then(r => r.json()),
+      ])
+      setOverview(ov)
+      setSeries(sr)
+    } catch (e) {
+      console.error('Dashboard fetch failed', e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { fetchData() }, [window60])
+
+  if (loading) return <div className="flex h-64 items-center justify-center text-muted-foreground">加载中...</div>
+
+  const fmtRate = (r: number) => `${(r * 100).toFixed(1)}%`
+  const rateColor = (r: number) => r >= 0.95 ? 'text-success' : r >= 0.8 ? 'text-yellow-500' : 'text-destructive'
+
+  const maxReq = Math.max(...series.map(b => b.requests), 1)
+
+  return (
+    <div className="space-y-6">
+      {/* KPI 卡片 */}
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">请求 (1h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.requests1h ?? 0}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">请求 (24h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.requests24h ?? 0}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">成功率 (1h)</div>
+          <div className={`mt-1 text-2xl font-bold tabular ${rateColor(overview?.successRate1h ?? 1)}`}>{fmtRate(overview?.successRate1h ?? 1)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">成功率 (24h)</div>
+          <div className={`mt-1 text-2xl font-bold tabular ${rateColor(overview?.successRate24h ?? 1)}`}>{fmtRate(overview?.successRate24h ?? 1)}</div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs text-muted-foreground">平均延迟 (1h)</div>
+          <div className="mt-1 text-2xl font-bold tabular">{overview?.avgLatencyMs1h ?? 0}<span className="ml-1 text-sm font-normal text-muted-foreground">ms</span></div>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        {/* 时序图（简易条形） */}
+        <Card className="col-span-2 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-sm font-semibold">请求量趋势</div>
+            <div className="flex items-center gap-1">
+              <Button size="sm" variant={window60 ? 'secondary' : 'ghost'} className="h-6 px-2 text-xs" onClick={() => setWindow60(true)}>1h</Button>
+              <Button size="sm" variant={!window60 ? 'secondary' : 'ghost'} className="h-6 px-2 text-xs" onClick={() => setWindow60(false)}>24h</Button>
+              <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => fetchData()}><RefreshCw className="h-3 w-3" /></Button>
+            </div>
+          </div>
+          {series.length === 0
+            ? <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">暂无数据</div>
+            : <div className="flex h-32 items-end gap-0.5">
+                {series.map((b, i) => {
+                  const h = Math.round((b.requests / maxReq) * 100)
+                  const errH = b.requests > 0 ? Math.round((b.errors / b.requests) * h) : 0
+                  const d = new Date(b.ts * 1000)
+                  const label = window60
+                    ? `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`
+                    : `${d.getHours().toString().padStart(2,'0')}h`
+                  return (
+                    <div key={i} className="group relative flex flex-1 flex-col items-center justify-end" title={`${label} 请求:${b.requests} 错误:${b.errors} 延迟:${b.avgLatencyMs}ms`}>
+                      <div className="w-full" style={{ height: `${h}%`, minHeight: b.requests > 0 ? '2px' : '0' }}>
+                        <div className="relative h-full w-full overflow-hidden rounded-sm bg-primary/40">
+                          {errH > 0 && <div className="absolute bottom-0 w-full rounded-sm bg-destructive/70" style={{ height: `${errH}%` }} />}
+                        </div>
+                      </div>
+                      {i % Math.ceil(series.length / 8) === 0 && (
+                        <div className="mt-0.5 text-[9px] text-muted-foreground">{label}</div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+          }
+          <div className="mt-2 flex gap-3 text-xs text-muted-foreground">
+            <span><span className="inline-block h-2 w-2 rounded-sm bg-primary/40 mr-1" />请求</span>
+            <span><span className="inline-block h-2 w-2 rounded-sm bg-destructive/70 mr-1" />错误</span>
+          </div>
+        </Card>
+
+        {/* 模型 Top10 */}
+        <Card className="p-4">
+          <div className="mb-3 text-sm font-semibold">模型 Top10 (1h)</div>
+          {!overview?.modelTop?.length
+            ? <div className="text-xs text-muted-foreground">暂无数据</div>
+            : <div className="space-y-2">
+                {overview.modelTop.map((m, i) => {
+                  const total = overview.modelTop.reduce((s, x) => s + x.count, 0)
+                  const pct = total > 0 ? (m.count / total) * 100 : 0
+                  return (
+                    <div key={i} className="space-y-0.5">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="truncate max-w-[160px]" title={m.model}>{m.model}</span>
+                        <span className="tabular text-muted-foreground">{m.count}</span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+          }
+        </Card>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
+// ApiKeysPanel — API Key 管理
+// ============================================================
+
+interface ApiKeyEntry {
+  id: string    // sha256 前 12 位，用于删除
+  masked: string
+  group: string | null
+}
+
+function ApiKeysPanel() {
+  const [keys, setKeys] = useState<ApiKeyEntry[]>([])
+  const [loading, setLoading] = useState(true)
+  const [newKey, setNewKey] = useState('')
+  const [newGroup, setNewGroup] = useState('')
+  const [adding, setAdding] = useState(false)
+
+  const authHeader = { 'Authorization': `Bearer ${storage.getApiKey()}`, 'Content-Type': 'application/json' }
+
+  const fetchKeys = async () => {
+    try {
+      const r = await fetch('/api/admin/api-keys', { headers: authHeader })
+      const data = await r.json()
+      setKeys(data ?? [])
+    } catch { /* ignore */ }
+    finally { setLoading(false) }
+  }
+
+  useEffect(() => { fetchKeys() }, [])
+
+  const handleAdd = async () => {
+    if (!newKey.trim()) return
+    setAdding(true)
+    try {
+      const r = await fetch('/api/admin/api-keys', {
+        method: 'POST',
+        headers: authHeader,
+        body: JSON.stringify({ key: newKey, group: newGroup || null }),
+      })
+      if (r.ok) {
+        toast.success('API Key 已添加')
+        setNewKey(''); setNewGroup('')
+        fetchKeys()
+      } else {
+        const e = await r.json().catch(() => ({}))
+        toast.error(e.message || '添加失败')
+      }
+    } finally { setAdding(false) }
+  }
+
+  const handleDelete = async (id: string) => {
+    try {
+      const r = await fetch(`/api/admin/api-keys/${id}`, { method: 'DELETE', headers: authHeader })
+      if (r.ok) { toast.success('已删除'); fetchKeys() }
+      else toast.error('删除失败')
+    } catch { toast.error('删除失败') }
+  }
+
+  if (loading) return <div className="flex h-64 items-center justify-center text-muted-foreground">加载中...</div>
+
+  return (
+    <div className="space-y-4 max-w-2xl">
+      <h2 className="text-lg font-semibold">API Key 管理</h2>
+      <p className="text-xs text-muted-foreground">配置多 API Key 及其分组路由。请求时在 Authorization 头中使用该 key；若配置了分组，请求将只从对应分组的账号中选号。</p>
+
+      {/* 添加表单 */}
+      <Card className="p-4 space-y-3">
+        <div className="text-sm font-medium">添加 Key</div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            placeholder="API Key（留空自动生成）"
+            value={newKey}
+            onChange={e => setNewKey(e.target.value)}
+          />
+          <input
+            className="w-28 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            placeholder="分组 (可选)"
+            value={newGroup}
+            onChange={e => setNewGroup(e.target.value)}
+          />
+          <Button size="sm" onClick={handleAdd} disabled={adding}>
+            <Plus className="mr-1 h-3.5 w-3.5" />{adding ? '添加中...' : '添加'}
+          </Button>
+        </div>
+      </Card>
+
+      {/* Key 列表 */}
+      {keys.length === 0
+        ? <div className="text-sm text-muted-foreground py-8 text-center">暂无 API Key，当前使用配置文件中的单 key 模式</div>
+        : <div className="rounded-md border overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="border-b bg-muted/40">
+                <tr>
+                  <th className="px-3 py-2 text-left font-medium">Key</th>
+                  <th className="px-3 py-2 text-left font-medium">分组</th>
+                  <th className="px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {keys.map((k, i) => (
+                  <tr key={k.id} className={i % 2 === 0 ? '' : 'bg-muted/20'}>
+                    <td className="px-3 py-2 font-mono">{k.masked}</td>
+                    <td className="px-3 py-2">{k.group ?? <span className="text-muted-foreground">—</span>}</td>
+                    <td className="px-3 py-2">
+                      <Button size="sm" variant="ghost" className="h-6 px-1.5" onClick={() => handleDelete(k.id)} title="删除">
+                        <Trash2 className="h-3 w-3 text-destructive" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+      }
     </div>
   )
 }

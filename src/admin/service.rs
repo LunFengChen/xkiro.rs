@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use anyhow::Context;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +25,14 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
-    ImportAction, ImportItemResult, ImportSummary, ImportTokenJsonRequest, ImportTokenJsonResponse,
+    CredentialsStatusResponse, DisableBatchResponse, ExportKamItem, ExportTokenJsonItem,
+    GlobalConfigResponse,
+    ImportAction, ImportItemResult, ImportJobSnapshot, ImportJobStatus, ImportSummary,
+    ImportTokenJsonRequest, ImportTokenJsonResponse,
     PresetItem,
     ProxyAutoAssignRequest, ProxyAutoAssignResponse, ProxyConfigResponse, ProxyImportRequest,
     ProxyImportResponse, ProxyTestResponse, ProxyUpsertRequest, RuntimeBalanceSnapshot,
-    RuntimeStatsItem, RuntimeStatsResponse,
+    RuntimeStatsItem, RuntimeStatsResponse, StartImportJobResponse,
     SystemPromptResponse, TokenJsonItem, UpdateCompressionConfigRequest,
     UpdateGlobalConfigRequest, UpdateProxyConfigRequest, UpdateSystemPromptRequest,
     UpsertUserPresetRequest,
@@ -103,6 +106,14 @@ pub struct AdminService {
     models_cache: Mutex<HashMap<(u64, Option<String>), CachedModels>>,
     /// 代理池(引用式绑定的运行时来源)。admin 管理 CRUD/测试/分配。
     proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
+    /// 后台导入任务状态表 (job_id → snapshot)
+    import_jobs: Arc<Mutex<HashMap<String, ImportJobSnapshot>>>,
+    /// 共享多 API Key 列表（与鉴权中间件同源，写入即热生效）
+    api_keys: crate::anthropic::middleware::SharedApiKeys,
+    /// config.json 路径（持久化 api_keys 增删）
+    config_path: Option<PathBuf>,
+    /// 请求时序埋点
+    pub metrics: crate::admin::metrics::SharedMetrics,
 }
 
 impl AdminService {
@@ -115,6 +126,9 @@ impl AdminService {
         truncation_recovery_notice: Arc<std::sync::atomic::AtomicBool>,
         known_endpoints: impl IntoIterator<Item = String>,
         proxy_manager: Arc<crate::kiro::proxy_manager::ProxyManager>,
+        api_keys: crate::anthropic::middleware::SharedApiKeys,
+        config_path: Option<PathBuf>,
+        metrics: crate::admin::metrics::SharedMetrics,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -135,6 +149,10 @@ impl AdminService {
             balance_semaphore: Arc::new(Semaphore::new(8)),
             models_cache: Mutex::new(HashMap::new()),
             proxy_manager,
+            import_jobs: Arc::new(Mutex::new(HashMap::new())),
+            api_keys,
+            config_path,
+            metrics,
         }
     }
 
@@ -287,6 +305,16 @@ impl AdminService {
                         let (just_dead, _) =
                             svc.proxy_manager
                                 .record_health(id, res.ok, res.error.clone());
+                        // 顺带补 geo：若代理存活且 region 尚未探测，借此次巡检回填
+                        if res.ok && entry.region.is_none() {
+                            if let Some(geo) = probe_proxy_geo(&entry).await {
+                                if let Err(e) = svc.proxy_manager.set_geo(id, geo.region, geo.country) {
+                                    tracing::warn!("巡检 geo 回填代理 #{} 失败: {}", id, e);
+                                } else {
+                                    tracing::info!("巡检 geo 回填代理 #{} 完成", id);
+                                }
+                            }
+                        }
                         Some((id, just_dead))
                     });
                 }
@@ -470,6 +498,8 @@ impl AdminService {
                 concurrency: entry.concurrency,
                 recovery_attempts: entry.recovery_attempts,
                 next_retry_at: entry.next_retry_at,
+                group: entry.group,
+                source: entry.source,
             })
             .collect();
 
@@ -802,6 +832,8 @@ impl AdminService {
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             concurrency: req.concurrency,
+            group: req.group.clone(),
+            source: req.source.clone(),
         };
 
         // 调用 token_manager 添加凭据
@@ -1427,6 +1459,38 @@ impl AdminService {
         self.token_manager
             .set_endpoint(id, endpoint)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_group(&self, id: u64, group: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_group(id, group)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_source(&self, id: u64, source: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_source(id, source)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量禁用/启用凭据
+    pub fn disable_credentials_batch(
+        &self,
+        ids: &[u64],
+        disabled: bool,
+    ) -> DisableBatchResponse {
+        let mut success_count = 0usize;
+        let mut failure_count = 0usize;
+        for &id in ids {
+            match self.set_disabled(id, disabled) {
+                Ok(_) => success_count += 1,
+                Err(_) => failure_count += 1,
+            }
+        }
+        DisableBatchResponse {
+            success_count,
+            failure_count,
+        }
     }
 
     /// 获取当前代理配置（脱敏）
@@ -2142,21 +2206,96 @@ impl AdminService {
 
     // ============ 批量导入 token.json ============
 
-    /// 批量导入 token.json
+    /// 启动后台批量导入，立即返回 job_id（由 handler 传入 Arc<Self>）
+    pub fn start_import_token_json(
+        self: Arc<Self>,
+        req: ImportTokenJsonRequest,
+    ) -> StartImportJobResponse {
+        let items = req.items.into_vec();
+        let dry_run = req.dry_run;
+        let total = items.len();
+
+        // 生成唯一 job_id（毫秒时间戳 + 总数，足够区分同机并发批次）
+        let job_id = format!(
+            "import-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            total
+        );
+
+        // 初始化快照
+        self.import_jobs.lock().insert(
+            job_id.clone(),
+            ImportJobSnapshot {
+                job_id: job_id.clone(),
+                status: ImportJobStatus::Running,
+                total,
+                done: 0,
+                added: 0,
+                skipped: 0,
+                invalid: 0,
+                error: None,
+            },
+        );
+
+        let import_jobs = Arc::clone(&self.import_jobs);
+        let svc = Arc::clone(&self);
+        let job_id_bg = job_id.clone();
+
+        tokio::spawn(async move {
+            let result = svc
+                .import_token_json_inner(items, dry_run, {
+                    let import_jobs = Arc::clone(&import_jobs);
+                    let jid = job_id_bg.clone();
+                    move |added_d: usize, skipped_d: usize, invalid_d: usize| {
+                        let mut jobs = import_jobs.lock();
+                        if let Some(snap) = jobs.get_mut(&jid) {
+                            snap.done += 1;
+                            snap.added += added_d;
+                            snap.skipped += skipped_d;
+                            snap.invalid += invalid_d;
+                        }
+                    }
+                })
+                .await;
+
+            let mut jobs = import_jobs.lock();
+            if let Some(snap) = jobs.get_mut(&job_id_bg) {
+                snap.status = ImportJobStatus::Done;
+                snap.added = result.summary.added;
+                snap.skipped = result.summary.skipped;
+                snap.invalid = result.summary.invalid;
+                snap.done = result.summary.parsed;
+            }
+        });
+
+        StartImportJobResponse { job_id, total }
+    }
+
+    /// 查询后台导入任务进度
+    pub fn get_import_job(&self, job_id: &str) -> Option<ImportJobSnapshot> {
+        self.import_jobs.lock().get(job_id).cloned()
+    }
+
+    /// 批量导入内部核心逻辑（同步执行，供后台 task 和旧接口共用）
     ///
     /// 解析官方 token.json 格式，按 provider 字段自动映射 authMethod：
     /// - BuilderId/builder-id/idc → idc
     /// - Social/social → social
-    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+    async fn import_token_json_inner<F>(
+        &self,
+        items: Vec<TokenJsonItem>,
+        dry_run: bool,
+        mut on_item_done: F,
+    ) -> ImportTokenJsonResponse
+    where
+        F: FnMut(usize, usize, usize) + Send + 'static,
+    {
         use futures::stream::{self, StreamExt};
-
-        let items = req.items.into_vec();
-        let dry_run = req.dry_run;
 
         /// 导入并发度：5 路并发刷新首验，兼顾速度与上游限流
         const IMPORT_CONCURRENCY: usize = 5;
 
-        // 同一请求内按 refreshToken 去重，避免并发下两条相同 token 同时通过去重检查
+        // 同一批次按 refreshToken 去重
         let mut seen_tokens = std::collections::HashSet::new();
         let prepared: Vec<(usize, TokenJsonItem, bool)> = items
             .into_iter()
@@ -2171,7 +2310,7 @@ impl AdminService {
             })
             .collect();
 
-        // 并发处理；buffer_unordered 限制在途任务数，结果顺序随完成顺序，最后按 index 排序
+        // 并发处理；结果按 index 排序还原
         let mut results: Vec<ImportItemResult> = stream::iter(prepared)
             .map(|(index, item, dup_in_batch)| async move {
                 if dup_in_batch {
@@ -2192,14 +2331,39 @@ impl AdminService {
 
         results.sort_by_key(|r| r.index);
 
+        // 导入完成后：为新增的号自动按 region 分配代理。
+        // Kiro 账号的可用模型取决于出口 IP——未绑代理(机房直连)时只放默认几个模型，
+        // claude-opus-4-8 等会被拒 INVALID_MODEL_ID；走代理后才解锁全部模型。
+        // 复用 auto_assign 的 region 匹配 + 负载均摊；dry_run 未落库故跳过。
+        if !dry_run {
+            let new_ids: Vec<u64> = results
+                .iter()
+                .filter(|r| matches!(r.action, ImportAction::Added))
+                .filter_map(|r| r.credential_id)
+                .collect();
+            if !new_ids.is_empty() {
+                let n = new_ids.len();
+                let resp = self.auto_assign_proxies(ProxyAutoAssignRequest {
+                    credential_ids: new_ids,
+                    reassign_bound: false,
+                });
+                tracing::info!(
+                    "导入后自动分配代理: {} 个新号, 成功绑定 {}, 无可用代理 {}",
+                    n,
+                    resp.assigned.len(),
+                    resp.skipped.len()
+                );
+            }
+        }
+
         let mut added = 0usize;
         let mut skipped = 0usize;
         let mut invalid = 0usize;
         for result in &results {
             match result.action {
-                ImportAction::Added => added += 1,
-                ImportAction::Skipped => skipped += 1,
-                ImportAction::Invalid => invalid += 1,
+                ImportAction::Added => { added += 1; on_item_done(1, 0, 0); }
+                ImportAction::Skipped => { skipped += 1; on_item_done(0, 1, 0); }
+                ImportAction::Invalid => { invalid += 1; on_item_done(0, 0, 1); }
             }
         }
 
@@ -2212,6 +2376,12 @@ impl AdminService {
             },
             items: results,
         }
+    }
+
+    /// 旧接口保留：同步等待全部完成（供测试/脚本直接调用）
+    pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
+        let items = req.items.into_vec();
+        self.import_token_json_inner(items, req.dry_run, |_, _, _| {}).await
     }
 
     /// 处理单个 token.json 项
@@ -2307,6 +2477,8 @@ impl AdminService {
             proxy_id: None,
             disabled: false,
             concurrency: None,
+            group: None,
+            source: None,
         };
 
         match self.token_manager.add_credential(new_cred, false).await {
@@ -2426,11 +2598,23 @@ impl AdminService {
     }
 
     /// 新增代理
-    pub fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
+    pub async fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
         let entry = Self::proxy_entry_from_req(req);
-        self.proxy_manager
+        let id = self
+            .proxy_manager
             .add(entry)
-            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))
+            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))?;
+        // Auto-detect geo via the proxy itself if region was not provided
+        if let Some(entry) = self.proxy_manager.get(id) {
+            if entry.region.is_none() {
+                if let Some(geo) = probe_proxy_geo(&entry).await {
+                    if let Err(e) = self.proxy_manager.set_geo(id, geo.region, geo.country) {
+                        tracing::warn!("新增代理 #{} 回填地理信息失败: {}", id, e);
+                    }
+                }
+            }
+        }
+        Ok(id)
     }
 
     /// 更新代理
@@ -2548,7 +2732,8 @@ impl AdminService {
         for id in new_ids {
             if let Some(entry) = self.proxy_manager.get(id) {
                 if let Some(geo) = probe_proxy_geo(&entry).await {
-                    // 行内/批量已显式指定 region 时,不用 ipinfo 覆盖;country 始终回填
+                    // Always store the auto-detected "country:region" label; skip only if
+                    // the caller explicitly provided a region (user intent takes precedence).
                     let region = if entry.region.is_some() { None } else { geo.region };
                     if let Err(e) = self.proxy_manager.set_geo(id, region, geo.country) {
                         tracing::warn!("代理 #{} 回填地理信息失败: {}", id, e);
@@ -2690,6 +2875,116 @@ impl AdminService {
             },
         }
     }
+
+    // ============ Dashboard 聚合 ============
+
+    /// 总览 KPI（1h / 24h 双窗口）
+    pub fn dashboard_overview(&self) -> crate::admin::metrics::DashboardOverview {
+        let now = chrono::Utc::now().timestamp();
+        self.metrics.overview(now)
+    }
+
+    /// 时序折线数据（window_minutes=60, interval_minutes=5 → 12 个点）
+    pub fn dashboard_series(
+        &self,
+        window_minutes: u64,
+        interval_minutes: u64,
+    ) -> Vec<crate::admin::metrics::SeriesBucket> {
+        let now = chrono::Utc::now().timestamp();
+        self.metrics.series(now, window_minutes, interval_minutes)
+    }
+
+    // ============ API Key 管理 ============
+
+    /// key → 稳定 id（sha256 前 12 位 hex）
+    fn api_key_id(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(key.as_bytes());
+        hex::encode(h.finalize())[..12].to_string()
+    }
+
+    /// 脱敏展示：保留前 11 位（sk-xkiro- 前缀区）与后 4 位
+    fn mask_api_key(key: &str) -> String {
+        let n = key.chars().count();
+        if n <= 12 {
+            // 太短：只露后两位
+            let tail: String = key.chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
+            return format!("…{}", tail);
+        }
+        let head: String = key.chars().take(11).collect();
+        let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("{}…{}", head, tail)
+    }
+
+    /// 列出全部 API Key（脱敏）
+    pub fn list_api_keys(&self) -> Vec<crate::admin::types::ApiKeyItem> {
+        self.api_keys
+            .read()
+            .iter()
+            .map(|e| crate::admin::types::ApiKeyItem {
+                masked: Self::mask_api_key(&e.key),
+                id: Self::api_key_id(&e.key),
+                group: e.group.clone(),
+            })
+            .collect()
+    }
+
+    /// 新增 API Key；key 留空则自动生成 sk-xkiro-<32hex>
+    pub fn add_api_key(
+        &self,
+        req: crate::admin::types::CreateApiKeyRequest,
+    ) -> anyhow::Result<crate::admin::types::CreateApiKeyResponse> {
+        let key = req
+            .key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| format!("sk-xkiro-{}", uuid::Uuid::new_v4().simple()));
+        let group = req
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty());
+
+        {
+            let mut keys = self.api_keys.write();
+            if keys.iter().any(|e| e.key == key) {
+                anyhow::bail!("该 API Key 已存在");
+            }
+            keys.push(crate::model::config::ApiKeyEntry {
+                key: key.clone(),
+                group: group.clone(),
+            });
+        }
+        self.persist_api_keys()?;
+        Ok(crate::admin::types::CreateApiKeyResponse { key, group })
+    }
+
+    /// 按 id（sha256 前缀）删除 API Key
+    pub fn delete_api_key(&self, id: &str) -> anyhow::Result<()> {
+        let before = self.api_keys.read().len();
+        self.api_keys
+            .write()
+            .retain(|e| Self::api_key_id(&e.key) != id);
+        let after = self.api_keys.read().len();
+        if before == after {
+            anyhow::bail!("未找到对应 API Key");
+        }
+        self.persist_api_keys()?;
+        Ok(())
+    }
+
+    /// 把当前内存中的 api_keys 写回 config.json（重载后覆盖 api_keys 字段再原子保存）
+    fn persist_api_keys(&self) -> anyhow::Result<()> {
+        let Some(path) = self.config_path.as_ref() else {
+            tracing::warn!("config_path 未知，API Key 变更仅在内存生效，重启后丢失");
+            return Ok(());
+        };
+        let mut config = crate::model::config::Config::load(path)
+            .with_context(|| format!("重载配置失败: {}", path.display()))?;
+        config.api_keys = self.api_keys.read().clone();
+        config.save().context("保存 config.json 失败")?;
+        Ok(())
+    }
 }
 
 /// ipinfo.io/json 探测到的出口地理信息(仅取关心的两个字段)
@@ -2702,11 +2997,30 @@ struct ProxyGeo {
 ///   1. 冒号分隔 `ip:port[:user:pass]` —— 无 scheme,默认补 `socks5://`
 ///   2. 逗号分隔 `url[,user[,pass]]` —— url 自带 scheme(http/https/socks5(h))
 /// 识别规则:含 `://` 或含 `,` → 走逗号格式;否则按冒号格式拆。
+/// 规范化 scheme 拼写（常见拼写错误 → 标准形式）
+fn normalize_proxy_scheme(url: &str) -> String {
+    // sock5 → socks5、sock4 → socks4、sock → socks5
+    let lower = url.to_lowercase();
+    if lower.starts_with("sock5://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    if lower.starts_with("sock4://") {
+        return format!("socks4://{}", &url[7..]);
+    }
+    if lower.starts_with("sock://") {
+        return format!("socks5://{}", &url[7..]);
+    }
+    url.to_string()
+}
+
 fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String>), String> {
-    let line = line.trim();
-    // 逗号格式(原有):显式 url[,user[,pass]]
-    if line.contains("://") || line.contains(',') {
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+    // 规范化 scheme（容忍 sock5/sock4/sock 拼写错误）
+    let normalized = normalize_proxy_scheme(line.trim());
+    let line = normalized.as_str();
+
+    // ① 逗号分隔:url,user,pass  或  url,user  或  url（逗号内的 url 可以包含 ://）
+    if line.contains(',') {
+        let parts: Vec<&str> = line.splitn(3, ',').map(|s| s.trim()).collect();
         let url = parts[0].to_string();
         if url.is_empty() {
             return Err("url 为空".to_string());
@@ -2715,27 +3029,69 @@ fn parse_proxy_line(line: &str) -> Result<(String, Option<String>, Option<String
         let password = parts.get(2).filter(|s| !s.is_empty()).map(|s| s.to_string());
         return Ok((url, username, password));
     }
-    // 冒号格式:ip:port 或 ip:port:user:pass,默认 socks5://
-    let parts: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
-    match parts.as_slice() {
-        [ip, port] => {
-            if ip.is_empty() || port.is_empty() {
-                return Err(format!("冒号格式需 ip:port,得到: {}", line));
-            }
-            Ok((format!("socks5://{}:{}", ip, port), None, None))
+
+    // ② 包含 :// — URL 格式，再判断 authority 里是否藏了 user:pass
+    if let Some(after_scheme) = line.find("://").map(|i| (i, &line[i + 3..])) {
+        let (scheme_end, authority) = after_scheme;
+        let scheme = &line[..scheme_end]; // socks5 / http / https / socks4 …
+
+        // 去掉 authority 中可能有的 path/query 部分
+        let authority = authority.split('/').next().unwrap_or(authority);
+
+        // 检查是否已包含 @ (标准格式 scheme://user:pass@host:port)
+        if authority.contains('@') {
+            // 标准 URL，直接用原串
+            return Ok((line.to_string(), None, None));
         }
-        [ip, port, user, pass] => {
-            if ip.is_empty() || port.is_empty() {
-                return Err(format!("冒号格式需 ip:port:user:pass,得到: {}", line));
+
+        // 尝试解析 host:port:user:pass（authority 段有 3 个冒号 → 4 段）
+        let colon_parts: Vec<&str> = authority.split(':').collect();
+        match colon_parts.as_slice() {
+            [host, port] => {
+                // scheme://host:port — 正常两段，无 auth
+                if host.is_empty() || port.is_empty() {
+                    return Err(format!("无效的代理地址: {}", line));
+                }
+                Ok((line.to_string(), None, None))
             }
-            let username = (!user.is_empty()).then(|| user.to_string());
-            let password = (!pass.is_empty()).then(|| pass.to_string());
-            Ok((format!("socks5://{}:{}", ip, port), username, password))
+            [host, port, user, pass] => {
+                // scheme://host:port:user:pass — user/pass 跟在端口后，重组为标准 URL
+                if host.is_empty() || port.is_empty() {
+                    return Err(format!("无效的代理地址: {}", line));
+                }
+                let username = (!user.is_empty()).then(|| user.to_string());
+                let password = (!pass.is_empty()).then(|| pass.to_string());
+                let clean_url = format!("{}://{}:{}", scheme, host, port);
+                Ok((clean_url, username, password))
+            }
+            _ => Err(format!(
+                "无法识别的代理格式(authority 段应为 host:port 或 host:port:user:pass): {}",
+                line
+            )),
         }
-        _ => Err(format!(
-            "无法识别的代理格式(支持 ip:port[:user:pass] 或 url[,user,pass]): {}",
-            line
-        )),
+    } else {
+        // ③ 纯冒号格式(无 ://): ip:port 或 ip:port:user:pass，默认 socks5://
+        let parts: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
+        match parts.as_slice() {
+            [ip, port] => {
+                if ip.is_empty() || port.is_empty() {
+                    return Err(format!("冒号格式需 ip:port，得到: {}", line));
+                }
+                Ok((format!("socks5://{}:{}", ip, port), None, None))
+            }
+            [ip, port, user, pass] => {
+                if ip.is_empty() || port.is_empty() {
+                    return Err(format!("冒号格式需 ip:port:user:pass，得到: {}", line));
+                }
+                let username = (!user.is_empty()).then(|| user.to_string());
+                let password = (!pass.is_empty()).then(|| pass.to_string());
+                Ok((format!("socks5://{}:{}", ip, port), username, password))
+            }
+            _ => Err(format!(
+                "无法识别的代理格式(支持 ip:port[:user:pass] / scheme://host:port[:user:pass] / url,user,pass): {}",
+                line
+            )),
+        }
     }
 }
 
@@ -2753,7 +3109,7 @@ async fn probe_proxy_geo(entry: &crate::kiro::proxy_manager::ProxyEntry) -> Opti
         return None;
     }
     let json: serde_json::Value = resp.json().await.ok()?;
-    let region = json
+    let region_raw = json
         .get("region")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -2763,9 +3119,16 @@ async fn probe_proxy_geo(entry: &crate::kiro::proxy_manager::ProxyEntry) -> Opti
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    if region.is_none() && country.is_none() {
+    if region_raw.is_none() && country.is_none() {
         return None;
     }
+    // Build "US:California" combined label stored as region
+    let region = match (&country, &region_raw) {
+        (Some(c), Some(r)) => Some(format!("{}:{}", c, r)),
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (None, None) => None,
+    };
     Some(ProxyGeo { region, country })
 }
 

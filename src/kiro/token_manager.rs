@@ -579,6 +579,12 @@ pub struct CredentialEntrySnapshot {
     /// 下一次自动重试时间（RFC3339；None=不参与自动重试或已耗尽）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<String>,
+    /// 路由分组标签（None=不限分组，参与所有请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 来源渠道标签（None=未设置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1014,7 +1020,7 @@ impl MultiTokenManager {
     /// 7. 完整 6 元组相同的段：rr 轮转，公平分摊。
     ///
     /// acquire_context 拿到列表后挨个 `try_acquire_owned`，第一个抢到 permit 的就用。
-    fn rank_candidates(&self, model: Option<&str>) -> Vec<u64> {
+    fn rank_candidates(&self, model: Option<&str>, group: Option<&str>) -> Vec<u64> {
         // 1. 过滤可用候选
         let candidate_ids: Vec<u64> = {
             let entries = self.entries.lock();
@@ -1025,6 +1031,11 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| !e.disabled)
                 .filter(|e| !is_opus || e.credentials.supports_opus())
+                // 分组过滤：group=Some(g) 时只选同分组的账号；None 时不限分组（全部可用）
+                .filter(|e| match group {
+                    Some(g) => e.credentials.group.as_deref() == Some(g),
+                    None => true,
+                })
                 .map(|e| e.id)
                 .collect()
         };
@@ -1243,15 +1254,16 @@ impl MultiTokenManager {
         &self,
         session_id: Option<&str>,
         model: Option<&str>,
+        group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
         // 全局 session 亲和开关：关闭时每条消息独立走 rank，多号天然平摊
         if !self.config.read().session_affinity_enabled {
-            return self.acquire_context(model).await;
+            return self.acquire_context(model, group).await;
         }
 
         let sid = match session_id {
             Some(s) if !s.is_empty() => s,
-            _ => return self.acquire_context(model).await,
+            _ => return self.acquire_context(model, group).await,
         };
 
         // 命中亲和绑定 → 校验后尝试复用
@@ -1340,13 +1352,13 @@ impl MultiTokenManager {
                     );
                     // 保留绑定：分流到 rank 选出的其他凭据，但不覆盖 affinity 映射，
                     // 等下次该 session 请求时再尝试黏回原凭据。
-                    return self.acquire_context(model).await;
+                    return self.acquire_context(model, group).await;
                 }
             }
         }
 
         // 未命中 / 凭据不可用 / token 刷新失败：rank 选 + 建立（或覆盖到新）绑定
-        let ctx = self.acquire_context(model).await?;
+        let ctx = self.acquire_context(model, group).await?;
         self.session_affinity.set(sid, ctx.id);
         Ok(ctx)
     }
@@ -1371,7 +1383,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
         // 检查是否需要自动恢复（5 分钟全局禁用）
         self.check_and_recover();
 
@@ -1393,7 +1405,7 @@ impl MultiTokenManager {
             }
 
             // 1. 收集候选（统一加权排序：priority asc, recent_usage asc, remaining desc）
-            let mut candidates = self.rank_candidates(model);
+            let mut candidates = self.rank_candidates(model, group);
 
             // 候选为空：尝试 TooManyFailures 自愈（等价于重启）
             if candidates.is_empty() {
@@ -1412,7 +1424,7 @@ impl MultiTokenManager {
                         }
                     }
                     drop(entries);
-                    candidates = self.rank_candidates(model);
+                    candidates = self.rank_candidates(model, group);
                 }
             }
 
@@ -2662,6 +2674,8 @@ impl MultiTokenManager {
                         e.disabled_at,
                         e.recovery_attempts,
                     ),
+                    group: e.credentials.group.clone(),
+                    source: e.credentials.source.clone(),
                 })
                 .collect(),
             total: entries.len(),
@@ -2916,6 +2930,40 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.proxy_id = proxy_id;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置指定凭据的路由分组标签（Admin API）
+    ///
+    /// 传 `None` 或空字符串表示清除分组，账号参与所有未限制的请求。
+    pub fn set_group(&self, id: u64, group: Option<String>) -> anyhow::Result<()> {
+        let group = group.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.group = group;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置指定凭据的来源渠道标签（Admin API）
+    ///
+    /// 传 `None` 或空字符串表示清除渠道。
+    pub fn set_source(&self, id: u64, source: Option<String>) -> anyhow::Result<()> {
+        let source = source.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.source = source;
         }
         self.persist_credentials()?;
         Ok(())

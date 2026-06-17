@@ -74,6 +74,12 @@ pub struct CredentialStatusItem {
     /// 下一次自动重试时间（RFC3339；None=不参与自动重试或已耗尽次数）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<String>,
+    /// 账号分组标签（用于 API key 路由按组选号；None=无分组，参与所有请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 账号来源渠道（如"中转A"；用于前端按渠道分组展示存活率）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -126,6 +132,40 @@ pub struct SetRegionRequest {
 pub struct SetEndpointRequest {
     /// endpoint 名称，空字符串或 null 表示回退到 defaultEndpoint
     pub endpoint: Option<String>,
+}
+
+/// 修改账号分组请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGroupRequest {
+    /// 分组标签（null / 空字符串 = 清除分组）
+    pub group: Option<String>,
+}
+
+/// 修改账号来源渠道请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSourceRequest {
+    /// 渠道名称（null / 空字符串 = 清除渠道）
+    pub source: Option<String>,
+}
+
+/// 批量禁用/启用请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisableBatchRequest {
+    /// 凭据 ID 列表
+    pub ids: Vec<u64>,
+    /// true = 禁用，false = 启用
+    pub disabled: bool,
+}
+
+/// 批量禁用/启用结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisableBatchResponse {
+    pub success_count: usize,
+    pub failure_count: usize,
 }
 
 /// 添加凭据请求
@@ -191,6 +231,14 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号分组标签（可选，用于按组路由 API key）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// 账号来源渠道（可选，如"中转A"；用于统计不同渠道存活率）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -505,6 +553,40 @@ pub enum ImportAction {
     Added,
     Skipped,
     Invalid,
+}
+
+// ============ 后台导入 Job ============
+
+/// 后台导入任务状态
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportJobStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// 后台导入任务快照（轮询接口返回）
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportJobSnapshot {
+    pub job_id: String,
+    pub status: ImportJobStatus,
+    pub total: usize,
+    pub done: usize,
+    pub added: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 启动后台导入的响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartImportJobResponse {
+    pub job_id: String,
+    pub total: usize,
 }
 
 // ============ 导出 token.json ============
@@ -922,3 +1004,44 @@ pub struct SetCredentialProxyRequest {
 }
 
 
+
+// ============ API Key 管理 ============
+
+/// API Key 列表项（明文脱敏，只回显前缀+后4位）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyItem {
+    /// 脱敏后的展示串，如 `sk-xkiro-abcd…wxyz`
+    pub masked: String,
+    /// 完整 key 的 sha256 前 12 位，作为删除时的稳定标识（避免传明文）
+    pub id: String,
+    /// 绑定分组（None=可访问所有无分组账号）
+    pub group: Option<String>,
+}
+
+/// 新建 API Key 请求
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyRequest {
+    /// 留空则自动生成 sk-xkiro-<32hex>
+    #[serde(default)]
+    pub key: Option<String>,
+    /// 绑定分组（可选）
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// 新建 API Key 响应（明文只在此返回一次）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyResponse {
+    pub key: String,
+    pub group: Option<String>,
+}
+
+/// 删除 API Key 请求（按 id=sha256 前缀定位）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteApiKeyRequest {
+    pub id: String,
+}

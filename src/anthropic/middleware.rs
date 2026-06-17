@@ -15,8 +15,16 @@ use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompressionConfig, PromptFilterConfig};
+use crate::model::config::{ApiKeyEntry, CompressionConfig, PromptFilterConfig};
+
+/// 共享的多 API Key 列表（运行时可热更新；admin 写入即对鉴权生效）
+pub type SharedApiKeys = Arc<RwLock<Vec<ApiKeyEntry>>>;
 use crate::model::runtime::{PromptRuntimeConfig, SharedPromptConfig};
+
+/// Request extension：鉴权时解析出的账号组（来自 api_keys 配置的 group 字段）
+/// None = 无分组限制（单 api_key 兼容模式，或 api_keys 中未配 group 的条目）
+#[derive(Clone, Debug)]
+pub struct AuthGroup(pub Option<String>);
 
 use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
@@ -69,8 +77,11 @@ impl PromptCacheRuntime {
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
+    /// API 密钥（单 key 兼容模式）
     pub api_key: String,
+    /// 多 API Key 配置（带可选分组，共享可热更新）
+    /// 非空时鉴权优先查此列表，空时回退到 api_key 单 key 模式
+    pub api_keys: SharedApiKeys,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -88,6 +99,8 @@ pub struct AppState {
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
     /// 是否在 system prompt 末尾注入截断恢复识别说明（运行时可改）
     pub truncation_recovery_notice: Arc<AtomicBool>,
+    /// 请求时序埋点（Dashboard 数据源，None = 功能未启用）
+    pub metrics: Option<crate::admin::metrics::SharedMetrics>,
 }
 
 impl AppState {
@@ -100,6 +113,7 @@ impl AppState {
     ) -> Self {
         Self {
             api_key: api_key.into(),
+            api_keys: Arc::new(RwLock::new(vec![])),
             kiro_provider: None,
             extract_thinking,
             profile_arn: None,
@@ -114,6 +128,7 @@ impl AppState {
             })),
             prompt_cache_runtime,
             truncation_recovery_notice,
+            metrics: None,
         }
     }
 
@@ -148,6 +163,11 @@ impl AppState {
         self
     }
 
+    pub fn with_metrics(mut self, metrics: crate::admin::metrics::SharedMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub fn prompt_cache_snapshot(&self) -> PromptCacheSnapshot {
         self.prompt_cache_runtime.read().snapshot()
     }
@@ -158,17 +178,43 @@ impl AppState {
 }
 
 /// API Key 认证中间件
+///
+/// 鉴权逻辑：
+/// 1. 若 `api_keys` 非空，按列表顺序做 constant-time 比较，匹配则注入 `AuthGroup`
+/// 2. 否则回退到 `api_key` 单 key 模式（AuthGroup = None）
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+    let Some(key) = auth::extract_api_key(&request) else {
+        let error = ErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    };
+
+    if !state.api_keys.read().is_empty() {
+        // 多 key 模式：查匹配，写入解析出的分组
+        let matched = state
+            .api_keys
+            .read()
+            .iter()
+            .find(|e| auth::constant_time_eq(&key, &e.key))
+            .map(|e| e.group.clone());
+        if let Some(group) = matched {
+            request.extensions_mut().insert(AuthGroup(group));
+            return next.run(request).await;
         }
+        let error = ErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    }
+
+    // 单 key 兼容模式
+    if auth::constant_time_eq(&key, &state.api_key) {
+        request.extensions_mut().insert(AuthGroup(None));
+        next.run(request).await
+    } else {
+        let error = ErrorResponse::authentication_error();
+        (StatusCode::UNAUTHORIZED, Json(error)).into_response()
     }
 }
 

@@ -35,6 +35,14 @@ export interface CredentialStatusItem {
   proxyId: number | null
   /** 凭据 region（出口区域标识） */
   region?: string
+  /** 自动恢复重试次数 */
+  recoveryAttempts: number
+  /** 下一次自动重试时间（ISO8601；undefined=不参与自动重试） */
+  nextRetryAt?: string
+  /** 路由分组标签（undefined=无分组，参与所有请求） */
+  group?: string
+  /** 来源渠道标签（如"中转A"；undefined=未设置） */
+  source?: string
 }
 
 // 全局配置响应

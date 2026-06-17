@@ -24,6 +24,7 @@
 
 mod error;
 mod handlers;
+pub mod metrics;
 mod middleware;
 mod router;
 mod service;

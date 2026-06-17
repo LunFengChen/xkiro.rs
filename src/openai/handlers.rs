@@ -297,7 +297,7 @@ async fn handle_chat_stream(
     prepared: PreparedRequest,
 ) -> Response {
     let mut api_result = match provider
-        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref(), None)
         .await
     {
         Ok(r) => r,
@@ -428,7 +428,7 @@ async fn handle_chat_non_stream(
     prepared: PreparedRequest,
 ) -> Response {
     let api_result = match provider
-        .call_api(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api(&prepared.request_body, prepared.user_id.as_deref(), None)
         .await
     {
         Ok(r) => r,
@@ -597,7 +597,7 @@ async fn handle_responses_stream(
     previous_response_id: Option<String>,
 ) -> Response {
     let mut api_result = match provider
-        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api_stream(&prepared.request_body, prepared.user_id.as_deref(), None)
         .await
     {
         Ok(r) => r,
@@ -735,7 +735,7 @@ async fn handle_responses_non_stream(
     previous_response_id: Option<String>,
 ) -> Response {
     let api_result = match provider
-        .call_api(&prepared.request_body, prepared.user_id.as_deref())
+        .call_api(&prepared.request_body, prepared.user_id.as_deref(), None)
         .await
     {
         Ok(r) => r,

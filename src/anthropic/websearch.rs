@@ -809,7 +809,7 @@ pub async fn call_mcp_api(
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let api_result = provider.call_mcp(&request_body, None).await?;
+    let api_result = provider.call_mcp(&request_body, None, None).await?;
 
     let body = api_result.response.text().await?;
     tracing::debug!("MCP response: {}", body);

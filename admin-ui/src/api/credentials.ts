@@ -346,3 +346,82 @@ export async function deleteUserPreset(id: string): Promise<SystemPromptResponse
   )
   return data
 }
+
+// ─── 后台导入 Job ──────────────────────────────────────────────────────────
+
+export type ImportJobStatus = 'Running' | 'Done' | 'Failed'
+
+export interface ImportJobSnapshot {
+  jobId: string
+  status: ImportJobStatus
+  total: number
+  done: number
+  added: number
+  skipped: number
+  invalid: number
+  error?: string
+}
+
+export interface StartImportJobResponse {
+  jobId: string
+  total: number
+}
+
+/** 启动后台 token.json 导入（立即返回 jobId，不等待完成） */
+export async function startImportJob(
+  items: object[],
+  dryRun = false,
+): Promise<StartImportJobResponse> {
+  const { data } = await api.post<StartImportJobResponse>(
+    '/credentials/import-token-json',
+    { items, dryRun },
+  )
+  return data
+}
+
+/** 查询后台导入任务进度 */
+export async function getImportJob(jobId: string): Promise<ImportJobSnapshot> {
+  const { data } = await api.get<ImportJobSnapshot>(
+    `/credentials/import-jobs/${encodeURIComponent(jobId)}`,
+  )
+  return data
+}
+
+// ─── group / source ──────────────────────────────────────────────────────────
+
+/** 设置凭据路由分组（null/'' = 清除分组） */
+export async function setCredentialGroup(
+  id: number,
+  group: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/group`, { group })
+  return data
+}
+
+/** 设置凭据来源渠道（null/'' = 清除渠道） */
+export async function setCredentialSource(
+  id: number,
+  source: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/source`, { source })
+  return data
+}
+
+// ─── 批量禁用 ────────────────────────────────────────────────────────────────
+
+export interface DisableBatchResponse {
+  successCount: number
+  failureCount: number
+}
+
+/** 批量禁用/启用凭据 */
+export async function disableCredentialsBatch(
+  ids: number[],
+  disabled: boolean
+): Promise<DisableBatchResponse> {
+  const { data } = await api.post<DisableBatchResponse>('/credentials/disable-batch', {
+    ids,
+    disabled,
+  })
+  return data
+}
