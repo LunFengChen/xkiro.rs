@@ -1497,11 +1497,9 @@ function DashboardPanel() {
 // ============================================================
 
 interface ApiKeyEntry {
-  id: number
-  key: string
+  id: string    // sha256 前 12 位，用于删除
+  masked: string
   group: string | null
-  label: string | null
-  created_at: string
 }
 
 function ApiKeysPanel() {
@@ -1509,7 +1507,6 @@ function ApiKeysPanel() {
   const [loading, setLoading] = useState(true)
   const [newKey, setNewKey] = useState('')
   const [newGroup, setNewGroup] = useState('')
-  const [newLabel, setNewLabel] = useState('')
   const [adding, setAdding] = useState(false)
 
   const authHeader = { 'Authorization': `Bearer ${storage.getApiKey()}`, 'Content-Type': 'application/json' }
@@ -1518,7 +1515,7 @@ function ApiKeysPanel() {
     try {
       const r = await fetch('/api/admin/api-keys', { headers: authHeader })
       const data = await r.json()
-      setKeys(data.keys ?? [])
+      setKeys(data ?? [])
     } catch { /* ignore */ }
     finally { setLoading(false) }
   }
@@ -1532,11 +1529,11 @@ function ApiKeysPanel() {
       const r = await fetch('/api/admin/api-keys', {
         method: 'POST',
         headers: authHeader,
-        body: JSON.stringify({ key: newKey, group: newGroup || null, label: newLabel || null }),
+        body: JSON.stringify({ key: newKey, group: newGroup || null }),
       })
       if (r.ok) {
         toast.success('API Key 已添加')
-        setNewKey(''); setNewGroup(''); setNewLabel('')
+        setNewKey(''); setNewGroup('')
         fetchKeys()
       } else {
         const e = await r.json().catch(() => ({}))
@@ -1545,7 +1542,7 @@ function ApiKeysPanel() {
     } finally { setAdding(false) }
   }
 
-  const handleDelete = async (id: number) => {
+  const handleDelete = async (id: string) => {
     try {
       const r = await fetch(`/api/admin/api-keys/${id}`, { method: 'DELETE', headers: authHeader })
       if (r.ok) { toast.success('已删除'); fetchKeys() }
@@ -1566,7 +1563,7 @@ function ApiKeysPanel() {
         <div className="flex flex-col gap-2 sm:flex-row">
           <input
             className="flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-            placeholder="API Key *"
+            placeholder="API Key（留空自动生成）"
             value={newKey}
             onChange={e => setNewKey(e.target.value)}
           />
@@ -1576,13 +1573,7 @@ function ApiKeysPanel() {
             value={newGroup}
             onChange={e => setNewGroup(e.target.value)}
           />
-          <input
-            className="w-32 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-            placeholder="备注 (可选)"
-            value={newLabel}
-            onChange={e => setNewLabel(e.target.value)}
-          />
-          <Button size="sm" onClick={handleAdd} disabled={adding || !newKey.trim()}>
+          <Button size="sm" onClick={handleAdd} disabled={adding}>
             <Plus className="mr-1 h-3.5 w-3.5" />{adding ? '添加中...' : '添加'}
           </Button>
         </div>
@@ -1595,22 +1586,16 @@ function ApiKeysPanel() {
             <table className="w-full text-xs">
               <thead className="border-b bg-muted/40">
                 <tr>
-                  <th className="px-3 py-2 text-left font-medium">#</th>
                   <th className="px-3 py-2 text-left font-medium">Key</th>
                   <th className="px-3 py-2 text-left font-medium">分组</th>
-                  <th className="px-3 py-2 text-left font-medium">备注</th>
-                  <th className="px-3 py-2 text-left font-medium">创建时间</th>
                   <th className="px-3 py-2" />
                 </tr>
               </thead>
               <tbody>
                 {keys.map((k, i) => (
                   <tr key={k.id} className={i % 2 === 0 ? '' : 'bg-muted/20'}>
-                    <td className="px-3 py-2 text-muted-foreground">{k.id}</td>
-                    <td className="px-3 py-2 font-mono">{k.key.slice(0, 8)}…{k.key.slice(-4)}</td>
+                    <td className="px-3 py-2 font-mono">{k.masked}</td>
                     <td className="px-3 py-2">{k.group ?? <span className="text-muted-foreground">—</span>}</td>
-                    <td className="px-3 py-2">{k.label ?? <span className="text-muted-foreground">—</span>}</td>
-                    <td className="px-3 py-2 text-muted-foreground">{new Date(k.created_at).toLocaleString()}</td>
                     <td className="px-3 py-2">
                       <Button size="sm" variant="ghost" className="h-6 px-1.5" onClick={() => handleDelete(k.id)} title="删除">
                         <Trash2 className="h-3 w-3 text-destructive" />
