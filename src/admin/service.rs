@@ -2331,6 +2331,31 @@ impl AdminService {
 
         results.sort_by_key(|r| r.index);
 
+        // 导入完成后：为新增的号自动按 region 分配代理。
+        // Kiro 账号的可用模型取决于出口 IP——未绑代理(机房直连)时只放默认几个模型，
+        // claude-opus-4-8 等会被拒 INVALID_MODEL_ID；走代理后才解锁全部模型。
+        // 复用 auto_assign 的 region 匹配 + 负载均摊；dry_run 未落库故跳过。
+        if !dry_run {
+            let new_ids: Vec<u64> = results
+                .iter()
+                .filter(|r| matches!(r.action, ImportAction::Added))
+                .filter_map(|r| r.credential_id)
+                .collect();
+            if !new_ids.is_empty() {
+                let n = new_ids.len();
+                let resp = self.auto_assign_proxies(ProxyAutoAssignRequest {
+                    credential_ids: new_ids,
+                    reassign_bound: false,
+                });
+                tracing::info!(
+                    "导入后自动分配代理: {} 个新号, 成功绑定 {}, 无可用代理 {}",
+                    n,
+                    resp.assigned.len(),
+                    resp.skipped.len()
+                );
+            }
+        }
+
         let mut added = 0usize;
         let mut skipped = 0usize;
         let mut invalid = 0usize;
