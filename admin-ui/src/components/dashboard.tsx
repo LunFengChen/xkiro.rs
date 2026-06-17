@@ -1100,10 +1100,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                             : <span className="text-muted-foreground/40">—</span>}
                         </div>
                         {/* 配额：主条 + 超额条 并排 */}
-                        <div className="flex-1 min-w-[220px] flex items-center gap-3">
+                        <div className="flex-1 min-w-[220px] flex items-center gap-5">
                           {/* 主配额 */}
                           <div className="flex-1 flex items-center gap-2">
-                            <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
+                            <span className="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
                               {limit > 0 ? <><span className="text-foreground font-medium">{Math.round(baseRemaining)}</span>/{limit}</> : '—'}
                             </span>
                             <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
@@ -1116,7 +1116,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                           {/* 超额 */}
                           {(overCap > 0 || overageOn) ? (
                             <div className="flex-1 flex items-center gap-2">
-                              <span className="w-16 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
+                              <span className="w-24 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
                                 ⚡{overCap > 0 ? <><span className="font-medium">{Math.round(overRemaining)}</span>/{overCap}</> : '已开'}
                               </span>
                               <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
