@@ -2563,11 +2563,23 @@ impl AdminService {
     }
 
     /// 新增代理
-    pub fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
+    pub async fn add_proxy(&self, req: ProxyUpsertRequest) -> Result<u64, AdminServiceError> {
         let entry = Self::proxy_entry_from_req(req);
-        self.proxy_manager
+        let id = self
+            .proxy_manager
             .add(entry)
-            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))
+            .map_err(|e| AdminServiceError::InternalError(format!("新增代理失败: {}", e)))?;
+        // Auto-detect geo via the proxy itself if region was not provided
+        if let Some(entry) = self.proxy_manager.get(id) {
+            if entry.region.is_none() {
+                if let Some(geo) = probe_proxy_geo(&entry).await {
+                    if let Err(e) = self.proxy_manager.set_geo(id, geo.region, geo.country) {
+                        tracing::warn!("新增代理 #{} 回填地理信息失败: {}", id, e);
+                    }
+                }
+            }
+        }
+        Ok(id)
     }
 
     /// 更新代理
@@ -2685,7 +2697,8 @@ impl AdminService {
         for id in new_ids {
             if let Some(entry) = self.proxy_manager.get(id) {
                 if let Some(geo) = probe_proxy_geo(&entry).await {
-                    // 行内/批量已显式指定 region 时,不用 ipinfo 覆盖;country 始终回填
+                    // Always store the auto-detected "country:region" label; skip only if
+                    // the caller explicitly provided a region (user intent takes precedence).
                     let region = if entry.region.is_some() { None } else { geo.region };
                     if let Err(e) = self.proxy_manager.set_geo(id, region, geo.country) {
                         tracing::warn!("代理 #{} 回填地理信息失败: {}", id, e);
@@ -3000,7 +3013,7 @@ async fn probe_proxy_geo(entry: &crate::kiro::proxy_manager::ProxyEntry) -> Opti
         return None;
     }
     let json: serde_json::Value = resp.json().await.ok()?;
-    let region = json
+    let region_raw = json
         .get("region")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
@@ -3010,9 +3023,16 @@ async fn probe_proxy_geo(entry: &crate::kiro::proxy_manager::ProxyEntry) -> Opti
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    if region.is_none() && country.is_none() {
+    if region_raw.is_none() && country.is_none() {
         return None;
     }
+    // Build "US:California" combined label stored as region
+    let region = match (&country, &region_raw) {
+        (Some(c), Some(r)) => Some(format!("{}:{}", c, r)),
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (None, None) => None,
+    };
     Some(ProxyGeo { region, country })
 }
 

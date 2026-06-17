@@ -480,7 +480,7 @@ pub async fn add_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<ProxyUpsertRequest>,
 ) -> impl IntoResponse {
-    match state.service.add_proxy(payload) {
+    match state.service.add_proxy(payload).await {
         Ok(id) => Json(SuccessResponse::new(format!("代理 #{} 已新增", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
