@@ -305,6 +305,16 @@ impl AdminService {
                         let (just_dead, _) =
                             svc.proxy_manager
                                 .record_health(id, res.ok, res.error.clone());
+                        // 顺带补 geo：若代理存活且 region 尚未探测，借此次巡检回填
+                        if res.ok && entry.region.is_none() {
+                            if let Some(geo) = probe_proxy_geo(&entry).await {
+                                if let Err(e) = svc.proxy_manager.set_geo(id, geo.region, geo.country) {
+                                    tracing::warn!("巡检 geo 回填代理 #{} 失败: {}", id, e);
+                                } else {
+                                    tracing::info!("巡检 geo 回填代理 #{} 完成", id);
+                                }
+                            }
+                        }
                         Some((id, just_dead))
                     });
                 }

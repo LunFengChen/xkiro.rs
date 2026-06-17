@@ -60,6 +60,22 @@ const EMPTY_FORM: FormState = {
   disabled: false,
 }
 
+/** 单行：若无已知 scheme 则补 socks5:// */
+function ensureProxyScheme(line: string): string {
+  const t = line.trim()
+  if (!t) return t
+  if (/^(https?|socks[45]?):\/\//i.test(t)) return t
+  return 'socks5://' + t
+}
+
+/** 批量文本：对每行补 scheme，空行/注释行保留原样 */
+function ensureProxySchemeBlock(text: string): string {
+  return text
+    .split('\n')
+    .map((l) => (l.trim() === '' || l.trimStart().startsWith('#') ? l : ensureProxyScheme(l)))
+    .join('\n')
+}
+
 function formStateToRequest(form: FormState): ProxyUpsertRequest {
   const req: ProxyUpsertRequest = {
     url: form.url.trim(),
@@ -444,7 +460,11 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
               <Input
                 value={form.url}
                 onChange={(e) => setForm({ ...form, url: e.target.value })}
-                placeholder="http://host:port 或 socks5://host:port"
+                onBlur={(e) => {
+                  const fixed = ensureProxyScheme(e.target.value)
+                  if (fixed !== form.url) setForm((f) => ({ ...f, url: fixed }))
+                }}
+                placeholder="host:port 或 socks5://host:port（离开输入框自动补前缀）"
                 className="h-8 text-sm"
               />
             </div>
