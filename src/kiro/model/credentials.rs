@@ -134,6 +134,9 @@ pub struct KiroCredentials {
     /// - `Some("admin")` → 仅 group="admin" 的 API key 可调用
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 账号来源渠道标识（如"中转A"、"官方直采"），用于前端按渠道统计存活率
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -383,6 +386,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            group: None,
+            source: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -503,6 +508,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            group: None,
+            source: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -536,6 +543,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            group: None,
+            source: None,
         };
 
         let json = creds.to_pretty_json().unwrap();

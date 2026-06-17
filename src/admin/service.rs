@@ -24,7 +24,8 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, BatchRefreshBalanceResponse,
     BatchRefreshBalanceResultItem, BatchRefreshResponse, BatchRefreshResultItem,
     CachedBalanceItem, CachedBalancesResponse, CompressionConfigResponse, CredentialStatusItem,
-    CredentialsStatusResponse, ExportKamItem, ExportTokenJsonItem, GlobalConfigResponse,
+    CredentialsStatusResponse, DisableBatchResponse, ExportKamItem, ExportTokenJsonItem,
+    GlobalConfigResponse,
     ImportAction, ImportItemResult, ImportJobSnapshot, ImportJobStatus, ImportSummary,
     ImportTokenJsonRequest, ImportTokenJsonResponse,
     PresetItem,
@@ -474,6 +475,8 @@ impl AdminService {
                 concurrency: entry.concurrency,
                 recovery_attempts: entry.recovery_attempts,
                 next_retry_at: entry.next_retry_at,
+                group: entry.group,
+                source: entry.source,
             })
             .collect();
 
@@ -807,6 +810,7 @@ impl AdminService {
             endpoint: req.endpoint,
             concurrency: req.concurrency,
             group: req.group.clone(),
+            source: req.source.clone(),
         };
 
         // 调用 token_manager 添加凭据
@@ -1432,6 +1436,38 @@ impl AdminService {
         self.token_manager
             .set_endpoint(id, endpoint)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_group(&self, id: u64, group: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_group(id, group)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn set_source(&self, id: u64, source: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_source(id, source)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量禁用/启用凭据
+    pub fn disable_credentials_batch(
+        &self,
+        ids: &[u64],
+        disabled: bool,
+    ) -> DisableBatchResponse {
+        let mut success_count = 0usize;
+        let mut failure_count = 0usize;
+        for &id in ids {
+            match self.set_disabled(id, disabled) {
+                Ok(_) => success_count += 1,
+                Err(_) => failure_count += 1,
+            }
+        }
+        DisableBatchResponse {
+            success_count,
+            failure_count,
+        }
     }
 
     /// 获取当前代理配置（脱敏）
@@ -2394,6 +2430,7 @@ impl AdminService {
             disabled: false,
             concurrency: None,
             group: None,
+            source: None,
         };
 
         match self.token_manager.add_credential(new_cred, false).await {

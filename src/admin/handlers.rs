@@ -9,11 +9,13 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, BatchRefreshRequest, ExportKamRequest, ExportTokenJsonRequest,
+        AddCredentialRequest, BatchRefreshRequest, DisableBatchRequest, ExportKamRequest,
+        ExportTokenJsonRequest,
         ImportTokenJsonRequest,
         ProxyAutoAssignRequest, ProxyImportRequest, ProxyUpsertRequest, SetConcurrencyRequest,
-        SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetOverageRequest,
-        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateGlobalConfigRequest,
+        SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetGroupRequest,
+        SetOverageRequest, SetPriorityRequest, SetRegionRequest, SetSourceRequest,
+        SuccessResponse, UpdateGlobalConfigRequest,
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
     },
 };
@@ -302,6 +304,46 @@ pub async fn set_credential_endpoint(
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/credentials/:id/group
+/// 设置凭据路由分组
+pub async fn set_credential_group(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetGroupRequest>,
+) -> impl IntoResponse {
+    match state.service.set_group(id, payload.group) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 分组已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/source
+/// 设置凭据来源渠道
+pub async fn set_credential_source(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetSourceRequest>,
+) -> impl IntoResponse {
+    match state.service.set_source(id, payload.source) {
+        Ok(_) => {
+            Json(SuccessResponse::new(format!("凭据 #{} 来源渠道已更新", id))).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/disable-batch
+/// 批量禁用/启用凭据
+pub async fn disable_credentials_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<DisableBatchRequest>,
+) -> impl IntoResponse {
+    let result = state
+        .service
+        .disable_credentials_batch(&payload.ids, payload.disabled);
+    Json(result)
 }
 
 /// GET /api/admin/proxy

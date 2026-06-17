@@ -9,14 +9,15 @@ use super::{
     handlers::{
         add_credential, add_proxy, auto_assign_proxies, delete_credential,
         delete_credentials_batch, delete_proxy,
-        delete_user_preset, export_kam, export_token_json,
+        delete_user_preset, disable_credentials_batch, export_kam, export_token_json,
         force_refresh_balances_batch, force_refresh_token, force_refresh_tokens_batch,
         get_all_credentials, get_cached_balances, get_compression_config, get_credential_balance,
         get_credential_models, get_global_config, get_import_job, get_proxy_config,
         get_runtime_stats, get_system_prompt, import_proxies, import_token_json, list_proxies,
         reset_failure_count, set_compression_config, set_credential_concurrency,
-        set_credential_disabled, set_credential_endpoint, set_credential_overage,
-        set_credential_priority, set_credential_proxy, set_credential_region, test_proxy,
+        set_credential_disabled, set_credential_endpoint, set_credential_group,
+        set_credential_overage, set_credential_priority, set_credential_proxy,
+        set_credential_region, set_credential_source, test_proxy,
         update_global_config, update_proxy, update_proxy_config, update_system_prompt,
         upsert_user_preset,
     },
@@ -84,6 +85,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
+        .route("/credentials/{id}/group", post(set_credential_group))
+        .route("/credentials/{id}/source", post(set_credential_source))
         .route("/credentials/runtime-stats", get(get_runtime_stats))
         .route(
             "/credentials/refresh-batch",
@@ -92,6 +95,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/delete-batch",
             post(delete_credentials_batch),
+        )
+        .route(
+            "/credentials/disable-batch",
+            post(disable_credentials_batch),
         )
         .route(
             "/credentials/refresh-balances-batch",

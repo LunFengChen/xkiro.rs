@@ -17,7 +17,7 @@ import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-
 import { SettingsDialog } from '@/components/settings-dialog'
 import { SystemPromptDialog } from '@/components/system-prompt-dialog'
 import { ProxyPoolDialog } from '@/components/proxy-pool-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useDisableBatch } from '@/hooks/use-credentials'
 import { useRuntimeStats } from '@/hooks/use-runtime-stats'
 import { useUiScale } from '@/hooks/use-ui-scale'
 import { getCredentialBalance, refreshBatch, refreshBalancesBatch, getCachedBalances, exportTokenJson, exportKam, deleteCredentialsBatch } from '@/api/credentials'
@@ -74,14 +74,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
+  const { mutateAsync: disableBatch } = useDisableBatch()
   const { data: runtimeMap } = useRuntimeStats()
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  // 按组/渠道过滤
+  const [filterGroup, setFilterGroup] = useState<string>('')
+  const [filterSource, setFilterSource] = useState<string>('')
+
+  // 计算分页（含 group/source 过滤）
+  const allCredentials = data?.credentials || []
+  const filteredCredentials = allCredentials.filter(c => {
+    if (filterGroup && (c.group ?? '') !== filterGroup) return false
+    if (filterSource && (c.source ?? '') !== filterSource) return false
+    return true
+  })
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
   // 切片后逐元素 merge runtimeMap 的实时字段（K/N + lastUsedAt + disabled）
-  const currentCredentials = (data?.credentials.slice(startIndex, endIndex) || []).map(credential => {
+  const currentCredentials = filteredCredentials.slice(startIndex, endIndex).map(credential => {
     const runtime = runtimeMap?.get(credential.id)
     if (!runtime) return credential
     return {
@@ -92,7 +103,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
       disabled: runtime.disabled,
     }
   })
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const disabledCredentialCount = allCredentials.filter(credential => credential.disabled).length || 0
+
+  // 所有不重复的 group / source 值（用于过滤下拉）
+  const allGroups = [...new Set(allCredentials.map(c => c.group).filter(Boolean) as string[])].sort()
+  const allSources = [...new Set(allCredentials.map(c => c.source).filter(Boolean) as string[])].sort()
 
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
@@ -283,6 +298,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
       toast.error(`批量删除失败: ${extractErrorMessage(err)}`)
     }
 
+    deselectAll()
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  }
+
+  // 批量禁用 / 批量启用
+  const handleBatchDisable = async (disabled: boolean) => {
+    if (selectedIds.size === 0) {
+      toast.error(`请先选择凭据`)
+      return
+    }
+    const ids = Array.from(selectedIds)
+    const label = disabled ? '禁用' : '启用'
+    try {
+      const res = await disableBatch({ ids, disabled })
+      if (res.failureCount === 0) {
+        toast.success(`成功${label} ${res.successCount} 个凭据`)
+      } else {
+        toast.warning(`${label}：成功 ${res.successCount}，失败 ${res.failureCount}`)
+      }
+    } catch (err) {
+      toast.error(`批量${label}失败: ${extractErrorMessage(err)}`)
+    }
     deselectAll()
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
   }
@@ -846,6 +883,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Trash2 className="h-3.5 w-3.5 mr-1.5" />
                   批量删除
                 </Button>
+                <Button
+                  onClick={() => handleBatchDisable(true)}
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  disabled={selectedIds.size === 0}
+                  title={`禁用选中的 ${selectedIds.size} 个凭据`}
+                >
+                  批量禁用
+                </Button>
+                <Button
+                  onClick={() => handleBatchDisable(false)}
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  disabled={selectedIds.size === 0}
+                  title={`启用选中的 ${selectedIds.size} 个凭据`}
+                >
+                  批量启用
+                </Button>
                 <span className="mx-1 h-6 w-px self-center bg-border" />
               </>
             )}
@@ -909,6 +966,62 @@ export function Dashboard({ onLogout }: DashboardProps) {
         </div>
 
         {/* 凭据列表 */}
+        {/* 分组 / 渠道快速过滤卡片 */}
+        {(allGroups.length > 0 || allSources.length > 0) && (
+          <div className="mb-3 flex flex-wrap gap-2 items-center">
+            {allSources.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-xs text-muted-foreground mr-1">渠道:</span>
+                <button
+                  onClick={() => { setFilterSource(''); setCurrentPage(1) }}
+                  className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterSource === '' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-border hover:bg-muted'}`}
+                >
+                  全部 ({allCredentials.length})
+                </button>
+                {allSources.map(src => {
+                  const cnt = allCredentials.filter(c => c.source === src).length
+                  const activeCnt = allCredentials.filter(c => c.source === src && !c.disabled).length
+                  return (
+                    <button
+                      key={src}
+                      onClick={() => { setFilterSource(src); setCurrentPage(1) }}
+                      className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterSource === src ? 'bg-purple-500 text-white border-purple-500' : 'bg-background border-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950 text-purple-700 dark:text-purple-400'}`}
+                      title={`存活: ${activeCnt}/${cnt}`}
+                    >
+                      {src} ({activeCnt}/{cnt})
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+            {allGroups.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 items-center">
+                <span className="text-xs text-muted-foreground mr-1">分组:</span>
+                <button
+                  onClick={() => { setFilterGroup(''); setCurrentPage(1) }}
+                  className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterGroup === '' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-border hover:bg-muted'}`}
+                >
+                  全部
+                </button>
+                {allGroups.map(grp => {
+                  const cnt = allCredentials.filter(c => c.group === grp).length
+                  const activeCnt = allCredentials.filter(c => c.group === grp && !c.disabled).length
+                  return (
+                    <button
+                      key={grp}
+                      onClick={() => { setFilterGroup(grp); setCurrentPage(1) }}
+                      className={`h-7 rounded-full px-3 text-xs font-medium border transition-colors ${filterGroup === grp ? 'bg-blue-500 text-white border-blue-500' : 'bg-background border-blue-300 hover:bg-blue-50 dark:hover:bg-blue-950 text-blue-700 dark:text-blue-400'}`}
+                      title={`存活: ${activeCnt}/${cnt}`}
+                    >
+                      {grp} ({activeCnt}/{cnt})
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {data?.credentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center text-sm text-muted-foreground">

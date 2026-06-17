@@ -386,3 +386,42 @@ export async function getImportJob(jobId: string): Promise<ImportJobSnapshot> {
   )
   return data
 }
+
+// ─── group / source ──────────────────────────────────────────────────────────
+
+/** 设置凭据路由分组（null/'' = 清除分组） */
+export async function setCredentialGroup(
+  id: number,
+  group: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/group`, { group })
+  return data
+}
+
+/** 设置凭据来源渠道（null/'' = 清除渠道） */
+export async function setCredentialSource(
+  id: number,
+  source: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/source`, { source })
+  return data
+}
+
+// ─── 批量禁用 ────────────────────────────────────────────────────────────────
+
+export interface DisableBatchResponse {
+  successCount: number
+  failureCount: number
+}
+
+/** 批量禁用/启用凭据 */
+export async function disableCredentialsBatch(
+  ids: number[],
+  disabled: boolean
+): Promise<DisableBatchResponse> {
+  const { data } = await api.post<DisableBatchResponse>('/credentials/disable-batch', {
+    ids,
+    disabled,
+  })
+  return data
+}

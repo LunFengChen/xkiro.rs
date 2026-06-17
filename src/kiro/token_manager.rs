@@ -579,6 +579,12 @@ pub struct CredentialEntrySnapshot {
     /// 下一次自动重试时间（RFC3339；None=不参与自动重试或已耗尽）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_at: Option<String>,
+    /// 路由分组标签（None=不限分组，参与所有请求）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 来源渠道标签（None=未设置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -2668,6 +2674,8 @@ impl MultiTokenManager {
                         e.disabled_at,
                         e.recovery_attempts,
                     ),
+                    group: e.credentials.group.clone(),
+                    source: e.credentials.source.clone(),
                 })
                 .collect(),
             total: entries.len(),
@@ -2922,6 +2930,40 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.proxy_id = proxy_id;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置指定凭据的路由分组标签（Admin API）
+    ///
+    /// 传 `None` 或空字符串表示清除分组，账号参与所有未限制的请求。
+    pub fn set_group(&self, id: u64, group: Option<String>) -> anyhow::Result<()> {
+        let group = group.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.group = group;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置指定凭据的来源渠道标签（Admin API）
+    ///
+    /// 传 `None` 或空字符串表示清除渠道。
+    pub fn set_source(&self, id: u64, source: Option<String>) -> anyhow::Result<()> {
+        let source = source.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.source = source;
         }
         self.persist_credentials()?;
         Ok(())

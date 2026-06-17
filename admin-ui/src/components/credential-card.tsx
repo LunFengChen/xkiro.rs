@@ -24,6 +24,8 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
   useSetOverage,
+  useSetGroup,
+  useSetSource,
 } from '@/hooks/use-credentials'
 import { useProxies, useSetCredentialProxy } from '@/hooks/use-proxies'
 import { getCredentialBalance } from '@/api/credentials'
@@ -197,6 +199,10 @@ export function CredentialCard({
   const [concurrencyValue, setConcurrencyValue] = useState(
     credential.concurrency == null ? '' : String(credential.concurrency)
   )
+  const [editingGroup, setEditingGroup] = useState(false)
+  const [groupValue, setGroupValue] = useState(credential.group ?? '')
+  const [editingSource, setEditingSource] = useState(false)
+  const [sourceValue, setSourceValue] = useState(credential.source ?? '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   // n4: 让「最后调用时间」相对时间动态刷新
@@ -217,6 +223,8 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken()
   const setOverage = useSetOverage()
   const overageMutating = setOverage.isPending
+  const setGroup = useSetGroup()
+  const setSource = useSetSource()
 
   // 代理绑定：列表用于回显 region/url，setProxy 用于绑定/解绑
   const { data: proxyData } = useProxies()
@@ -346,6 +354,32 @@ export function CredentialCard({
     })
   }
 
+  const handleGroupChange = () => {
+    setGroup.mutate(
+      { id: credential.id, group: groupValue.trim() || null },
+      {
+        onSuccess: () => {
+          toast.success('分组已更新')
+          setEditingGroup(false)
+        },
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
+
+  const handleSourceChange = () => {
+    setSource.mutate(
+      { id: credential.id, source: sourceValue.trim() || null },
+      {
+        onSuccess: () => {
+          toast.success('渠道已更新')
+          setEditingSource(false)
+        },
+        onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+      }
+    )
+  }
+
   const handleForceRefresh = () => {
     forceRefresh.mutate(credential.id, {
       onSuccess: (res) => {
@@ -444,6 +478,16 @@ export function CredentialCard({
               {credential.disabled && (
                 <Badge variant="destructive" className="h-4 rounded px-1.5 text-2xs font-medium">
                   {credential.disabledReason || '已禁用'}
+                </Badge>
+              )}
+              {credential.group && (
+                <Badge variant="outline" className="h-4 rounded px-1.5 text-2xs font-medium border-blue-400 text-blue-600 dark:text-blue-400">
+                  {credential.group}
+                </Badge>
+              )}
+              {credential.source && (
+                <Badge variant="outline" className="h-4 rounded px-1.5 text-2xs font-medium border-purple-400 text-purple-600 dark:text-purple-400">
+                  {credential.source}
                 </Badge>
               )}
             </div>
@@ -606,6 +650,60 @@ export function CredentialCard({
                 </option>
               ))}
             </select>
+          </div>
+
+          {/* 分组（可编辑） */}
+          <div className="col-span-2 flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">分组</span>
+            {editingGroup ? (
+              <div className="flex items-center gap-1">
+                <Input
+                  value={groupValue}
+                  onChange={(e) => setGroupValue(e.target.value)}
+                  placeholder="留空=清除"
+                  className="h-6 w-28 text-xs"
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleGroupChange(); if (e.key === 'Escape') { setEditingGroup(false); setGroupValue(credential.group ?? '') } }}
+                  autoFocus
+                />
+                <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={handleGroupChange} disabled={setGroup.isPending}>✓</Button>
+                <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={() => { setEditingGroup(false); setGroupValue(credential.group ?? '') }}>✕</Button>
+              </div>
+            ) : (
+              <button
+                className="max-w-[60%] truncate font-medium hover:underline text-right"
+                onClick={() => setEditingGroup(true)}
+                title={credential.group ? `分组: ${credential.group}，点击编辑` : '无分组，点击设置'}
+              >
+                {credential.group || <span className="text-muted-foreground text-2xs">无</span>}
+              </button>
+            )}
+          </div>
+
+          {/* 渠道（可编辑） */}
+          <div className="col-span-2 flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">渠道</span>
+            {editingSource ? (
+              <div className="flex items-center gap-1">
+                <Input
+                  value={sourceValue}
+                  onChange={(e) => setSourceValue(e.target.value)}
+                  placeholder="留空=清除"
+                  className="h-6 w-28 text-xs"
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleSourceChange(); if (e.key === 'Escape') { setEditingSource(false); setSourceValue(credential.source ?? '') } }}
+                  autoFocus
+                />
+                <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={handleSourceChange} disabled={setSource.isPending}>✓</Button>
+                <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={() => { setEditingSource(false); setSourceValue(credential.source ?? '') }}>✕</Button>
+              </div>
+            ) : (
+              <button
+                className="max-w-[60%] truncate font-medium hover:underline text-right"
+                onClick={() => setEditingSource(true)}
+                title={credential.source ? `渠道: ${credential.source}，点击编辑` : '未设置渠道，点击添加'}
+              >
+                {credential.source || <span className="text-muted-foreground text-2xs">未设置</span>}
+              </button>
+            )}
           </div>
         </div>
 
