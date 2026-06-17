@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - mydev    # 开发分支：只编译验证，不推镜像
+      - master   # 中间分支同理
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install admin-ui deps
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-musl-x64"
+          cache-on-failure: true
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cargo build (musl, release)
+        run: cargo build --release --target x86_64-unknown-linux-musl --no-default-features
