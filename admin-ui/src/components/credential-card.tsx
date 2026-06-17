@@ -663,7 +663,7 @@ export function CredentialCard({
                   <optgroup key={group} label={group}>
                     {items.map((p) => (
                       <option key={p.id} value={String(p.id)}>
-                        {p.url}{p.dead ? '（离线）' : ''}
+                        {p.region || p.country || p.note || `#${p.id}`}{p.dead ? '（离线）' : ''}
                       </option>
                     ))}
                   </optgroup>
