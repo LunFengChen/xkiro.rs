@@ -89,3 +89,16 @@ export async function setCredentialProxy(
   )
   return data
 }
+
+// 按 region 为号绑定代理（region = null 解绑）
+// 后端从该 region 下挑负载最低的存活代理自动绑定
+export async function setCredentialProxyByRegion(
+  id: number,
+  region: string | null,
+): Promise<{ message: string; proxyId: number | null }> {
+  const { data } = await api.post<{ message: string; proxyId: number | null }>(
+    `/credentials/${id}/proxy-by-region`,
+    { region },
+  )
+  return data
+}

@@ -2673,6 +2673,61 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(format!("设置号代理绑定失败: {}", e)))
     }
 
+    /// 按 region 为单个号绑定代理：从该 region 下负载最低的存活代理中选一个。
+    /// region=None 等同于解绑。
+    /// 返回实际绑定的代理 id（解绑时为 None）。
+    pub fn set_credential_proxy_by_region(
+        &self,
+        cred_id: u64,
+        region: Option<&str>,
+    ) -> Result<Option<u64>, AdminServiceError> {
+        let Some(region) = region else {
+            // 解绑
+            self.token_manager
+                .set_proxy_id(cred_id, None)
+                .map_err(|e| AdminServiceError::InternalError(format!("解绑代理失败: {}", e)))?;
+            return Ok(None);
+        };
+
+        // 统计各代理当前绑定数（负载），用于均摊选择
+        let all_bindings = self.token_manager.credential_region_bindings();
+        let mut load: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for (_, _, pid, _) in &all_bindings {
+            if let Some(p) = pid {
+                *load.entry(*p).or_insert(0) += 1;
+            }
+        }
+
+        // 候选：启用 + 未 dead + region 精确匹配或代理无 region（通配）
+        let proxies = self.proxy_manager.list();
+        let mut candidates: Vec<u64> = proxies
+            .iter()
+            .filter(|v| !v.entry.disabled && !v.health.dead)
+            .filter(|v| match &v.entry.region {
+                Some(pr) => pr == region,
+                None => true, // 无 region 代理通配
+            })
+            .filter_map(|v| v.entry.id)
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "region '{}' 下无可用代理",
+                region
+            )));
+        }
+
+        // 按负载升序，取负载最低的
+        candidates.sort_by_key(|p| *load.get(p).unwrap_or(&0));
+        let pid = candidates[0];
+
+        self.token_manager
+            .set_proxy_id(cred_id, Some(pid))
+            .map_err(|e| AdminServiceError::InternalError(format!("设置号代理绑定失败: {}", e)))?;
+
+        Ok(Some(pid))
+    }
+
     /// 测试单个代理连通性(经代理请求出口 IP 探测端点)
     pub async fn test_proxy(&self, id: u64) -> ProxyTestResponse {
         let entry = match self.proxy_manager.get(id) {

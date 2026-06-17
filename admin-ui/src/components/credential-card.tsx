@@ -27,7 +27,7 @@ import {
   useSetGroup,
   useSetSource,
 } from '@/hooks/use-credentials'
-import { useProxies, useSetCredentialProxy } from '@/hooks/use-proxies'
+import { useProxies, useSetCredentialProxyByRegion } from '@/hooks/use-proxies'
 import { getCredentialBalance } from '@/api/credentials'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { maskEmail } from '@/lib/utils'
@@ -226,20 +226,24 @@ export function CredentialCard({
   const setGroup = useSetGroup()
   const setSource = useSetSource()
 
-  // 代理绑定：列表用于回显 region/url，setProxy 用于绑定/解绑
+  // 代理绑定：列表用于构建 region 下拉，byRegion 用于实际绑定
   const { data: proxyData } = useProxies()
-  const setProxy = useSetCredentialProxy()
+  const setProxyByRegion = useSetCredentialProxyByRegion()
   const boundProxy = proxyData?.proxies.find((p) => p.id === credential.proxyId) ?? null
 
-  const handleSetProxy = (proxyId: number | null) => {
-    setProxy.mutate(
-      { id: credential.id, proxyId },
+  // 当前绑定的 region（用于下拉回显）
+  const boundRegion = boundProxy?.region ?? null
+
+  const handleSetProxyByRegion = (region: string | null) => {
+    setProxyByRegion.mutate(
+      { id: credential.id, region },
       {
-        onSuccess: (res) => toast.success(res.message || (proxyId == null ? '已解绑代理' : '已绑定代理')),
+        onSuccess: (res) => toast.success(res.message || (region == null ? '已解绑代理' : `已绑定 ${region}`)),
         onError: (err) => toast.error('操作失败: ' + (err as Error).message),
       },
     )
   }
+
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -624,51 +628,39 @@ export function CredentialCard({
               <span className="truncate font-mono text-2xs" title={credential.proxyUrl}>{credential.proxyUrl}</span>
             </div>
           )}
-          {/* 代理池绑定（可选择/解绑） */}
+          {/* 代理池绑定：按 region 选择，后端自动挑该 region 下负载最低的代理 */}
           <div className="col-span-2 flex items-center justify-between gap-2">
             <span className="text-muted-foreground">代理池</span>
             <select
-              value={credential.proxyId == null ? '' : String(credential.proxyId)}
-              disabled={setProxy.isPending}
+              value={boundRegion ?? ''}
+              disabled={setProxyByRegion.isPending}
               onChange={(e) => {
                 const v = e.target.value
-                handleSetProxy(v === '' ? null : parseInt(v, 10))
+                handleSetProxyByRegion(v === '' ? null : v)
               }}
               className="h-6 max-w-[60%] rounded-md border border-input bg-background px-1.5 text-2xs"
-              title={boundProxy ? `${boundProxy.region ? boundProxy.region + ' · ' : ''}${boundProxy.url}` : '未绑定代理池'}
+              title={boundProxy ? `${boundProxy.region ?? ''} · ${boundProxy.url}` : '未绑定代理池'}
             >
               <option value="">未绑定</option>
-              {boundProxy == null && credential.proxyId != null && (
-                <option value={String(credential.proxyId)}>
-                  #{credential.proxyId}（已失效）
-                </option>
-              )}
-              {/* 按 region 分组：有 region 的用 optgroup，无 region 的放"未分组" */}
-              {(() => {
-                const proxies = proxyData?.proxies ?? []
-                // 建分组 map，保持插入顺序；有名分组先，未分组最后
-                const groups = new Map<string, typeof proxies>()
-                for (const p of proxies) {
-                  const key = p.region?.trim() || '未分组'
-                  if (!groups.has(key)) groups.set(key, [])
-                  groups.get(key)!.push(p)
-                }
-                // 排序：命名分组按字母，未分组置尾
-                const sorted = [...groups.entries()].sort(([a], [b]) => {
-                  if (a === '未分组') return 1
-                  if (b === '未分组') return -1
-                  return a.localeCompare(b)
-                })
-                return sorted.map(([group, items]) => (
-                  <optgroup key={group} label={group}>
-                    {items.map((p) => (
-                      <option key={p.id} value={String(p.id)}>
-                        {p.region || p.country || p.note || `#${p.id}`}{p.dead ? '（离线）' : ''}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))
-              })()}
+              {/* 当前绑定的代理所属 region 不在列表中（已被删除等）时，单独显示回退项 */}
+              {boundRegion != null &&
+                !(proxyData?.proxies ?? []).some((p) => p.region === boundRegion) && (
+                  <option value={boundRegion}>{boundRegion}（仅当前）</option>
+                )}
+              {/* 去重后的 region 列表，按字母排序；无 region 的代理不暴露（通配兜底由后端处理） */}
+              {Array.from(
+                new Set(
+                  (proxyData?.proxies ?? [])
+                    .map((p) => p.region?.trim())
+                    .filter((r): r is string => !!r),
+                ),
+              )
+                .sort((a, b) => a.localeCompare(b))
+                .map((region) => (
+                  <option key={region} value={region}>
+                    {region}
+                  </option>
+                ))}
             </select>
           </div>
 

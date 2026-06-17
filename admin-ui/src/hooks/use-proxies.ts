@@ -8,6 +8,7 @@ import {
   importProxies,
   autoAssignProxies,
   setCredentialProxy,
+  setCredentialProxyByRegion,
 } from '@/api/proxies'
 import { usePageActive } from '@/hooks/use-page-active'
 import type {
@@ -99,6 +100,18 @@ export function useSetCredentialProxy() {
   return useMutation({
     mutationFn: ({ id, proxyId }: { id: number; proxyId: number | null }) =>
       setCredentialProxy(id, proxyId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['proxies'] })
+    },
+  })
+}
+
+export function useSetCredentialProxyByRegion() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, region }: { id: number; region: string | null }) =>
+      setCredentialProxyByRegion(id, region),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['proxies'] })

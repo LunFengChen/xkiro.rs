@@ -1003,6 +1003,24 @@ pub struct SetCredentialProxyRequest {
     pub proxy_id: Option<u64>,
 }
 
+/// 按 region 为单个号绑定代理请求
+/// 后端从 region 下负载最低的存活代理中自动挑一个绑上
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyByRegionRequest {
+    /// 目标 region(如 "US:California");None=解绑
+    pub region: Option<String>,
+}
+
+/// 按 region 绑定代理的响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyByRegionResponse {
+    pub message: String,
+    /// 实际绑定的代理 id;解绑时为 None
+    pub proxy_id: Option<u64>,
+}
+
 
 
 // ============ API Key 管理 ============

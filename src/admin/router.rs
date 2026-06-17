@@ -17,6 +17,7 @@ use super::{
         reset_failure_count, set_compression_config, set_credential_concurrency,
         set_credential_disabled, set_credential_endpoint, set_credential_group,
         set_credential_overage, set_credential_priority, set_credential_proxy,
+        set_credential_proxy_by_region,
         set_credential_region, set_credential_source, test_proxy,
         update_global_config, update_proxy, update_proxy_config, update_system_prompt,
         upsert_user_preset,
@@ -87,6 +88,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
         .route("/credentials/{id}/overage", post(set_credential_overage))
         .route("/credentials/{id}/proxy", post(set_credential_proxy))
+        .route("/credentials/{id}/proxy-by-region", post(set_credential_proxy_by_region))
         .route("/credentials/{id}/group", post(set_credential_group))
         .route("/credentials/{id}/source", post(set_credential_source))
         .route("/credentials/runtime-stats", get(get_runtime_stats))

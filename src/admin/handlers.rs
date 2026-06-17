@@ -15,6 +15,7 @@ use super::{
         ProxyAutoAssignRequest, ProxyImportRequest, ProxyUpsertRequest, SetConcurrencyRequest,
         SetCredentialProxyRequest, SetDisabledRequest, SetEndpointRequest, SetGroupRequest,
         SetOverageRequest, SetPriorityRequest, SetRegionRequest, SetSourceRequest,
+        SetCredentialProxyByRegionRequest,
         SuccessResponse, UpdateGlobalConfigRequest,
         UpdateProxyConfigRequest, UpdateSystemPromptRequest, UpsertUserPresetRequest,
         CreateApiKeyRequest,
@@ -550,6 +551,26 @@ pub async fn set_credential_proxy(
                 None => format!("号 #{} 已解绑代理", id),
             };
             Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy-by-region — 按 region 自动绑定代理
+/// 前端传 region 字符串，后端从该 region 下挑负载最低的存活代理绑上；
+/// region=null 等同于解绑。
+pub async fn set_credential_proxy_by_region(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyByRegionRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy_by_region(id, payload.region.as_deref()) {
+        Ok(bound_id) => {
+            let msg = match bound_id {
+                Some(pid) => format!("号 #{} 已绑定代理 #{}", id, pid),
+                None => format!("号 #{} 已解绑代理", id),
+            };
+            Json(serde_json::json!({ "message": msg, "proxyId": bound_id })).into_response()
         }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
