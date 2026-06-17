@@ -65,7 +65,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(import_token_json),
         )
         .route(
-            "/credentials/import-jobs/:job_id",
+            "/credentials/import-jobs/{job_id}",
             get(get_import_job),
         )
         .route(
