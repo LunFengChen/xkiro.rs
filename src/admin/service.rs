@@ -2285,15 +2285,17 @@ impl AdminService {
         &self,
         items: Vec<TokenJsonItem>,
         dry_run: bool,
-        mut on_item_done: F,
+        on_item_done: F,
     ) -> ImportTokenJsonResponse
     where
-        F: FnMut(usize, usize, usize) + Send + 'static,
+        F: Fn(usize, usize, usize) + Send + Sync + 'static,
     {
         use futures::stream::{self, StreamExt};
 
         /// 导入并发度：5 路并发刷新首验，兼顾速度与上游限流
         const IMPORT_CONCURRENCY: usize = 5;
+
+        let on_item_done = std::sync::Arc::new(on_item_done);
 
         // 同一批次按 refreshToken 去重
         let mut seen_tokens = std::collections::HashSet::new();
@@ -2310,20 +2312,31 @@ impl AdminService {
             })
             .collect();
 
-        // 并发处理；结果按 index 排序还原
+        // 并发处理；每完成一条立刻回调更新进度，结果收齐后按 index 排序
         let mut results: Vec<ImportItemResult> = stream::iter(prepared)
-            .map(|(index, item, dup_in_batch)| async move {
-                if dup_in_batch {
-                    let fingerprint = Self::generate_fingerprint(&item);
-                    return ImportItemResult {
-                        index,
-                        fingerprint,
-                        action: ImportAction::Skipped,
-                        reason: Some("本次导入中重复的 refreshToken".to_string()),
-                        credential_id: None,
+            .map(|(index, item, dup_in_batch)| {
+                let cb = std::sync::Arc::clone(&on_item_done);
+                async move {
+                    let result = if dup_in_batch {
+                        let fingerprint = Self::generate_fingerprint(&item);
+                        ImportItemResult {
+                            index,
+                            fingerprint,
+                            action: ImportAction::Skipped,
+                            reason: Some("本次导入中重复的 refreshToken".to_string()),
+                            credential_id: None,
+                        }
+                    } else {
+                        self.process_token_json_item(index, item, dry_run).await
                     };
+                    // 每条完成后立刻更新进度
+                    match result.action {
+                        ImportAction::Added => cb(1, 0, 0),
+                        ImportAction::Skipped => cb(0, 1, 0),
+                        ImportAction::Invalid => cb(0, 0, 1),
+                    }
+                    result
                 }
-                self.process_token_json_item(index, item, dry_run).await
             })
             .buffer_unordered(IMPORT_CONCURRENCY)
             .collect()
@@ -2361,9 +2374,9 @@ impl AdminService {
         let mut invalid = 0usize;
         for result in &results {
             match result.action {
-                ImportAction::Added => { added += 1; on_item_done(1, 0, 0); }
-                ImportAction::Skipped => { skipped += 1; on_item_done(0, 1, 0); }
-                ImportAction::Invalid => { invalid += 1; on_item_done(0, 0, 1); }
+                ImportAction::Added => { added += 1; }
+                ImportAction::Skipped => { skipped += 1; }
+                ImportAction::Invalid => { invalid += 1; }
             }
         }
 
