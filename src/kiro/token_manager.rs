@@ -3657,11 +3657,20 @@ impl MultiTokenManager {
             (retry, delete)
         };
 
-        // 2. 删除耗尽的凭据
-        for id in to_delete {
-            match self.delete_credential(id) {
-                Ok(_) => tracing::warn!("凭据 #{} 多次重试仍失败，已自动删除", id),
-                Err(e) => tracing::warn!("自动删除凭据 #{} 失败: {}", id, e),
+        // 2. 重试耗尽的凭据：改为永久禁用（Manual），不再自动删除
+        //    手动到管理界面删除，避免无声丢失账号数据。
+        if !to_delete.is_empty() {
+            {
+                let mut entries = self.entries.lock();
+                for id in &to_delete {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.disabled_reason = Some(DisabledReason::Manual);
+                        tracing::warn!("凭据 #{} 多次重试仍失败，已标记为永久禁用（需手动删除）", id);
+                    }
+                }
+            }
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("永久禁用凭据后持久化失败: {}", e);
             }
         }
 
