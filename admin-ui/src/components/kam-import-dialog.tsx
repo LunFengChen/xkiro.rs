@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -117,6 +117,21 @@ export function KamImportDialog({ open, onOpenChange, onJobStart }: KamImportDia
   const [jsonInput, setJsonInput] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const readFile = async (file: File) => {
+    if (!/\.(json|txt)$/i.test(file.name) && file.type && !file.type.includes('json') && !file.type.includes('text')) {
+      toast.error('仅支持 .json / 文本文件')
+      return
+    }
+    try {
+      const text = await file.text()
+      setJsonInput(text)
+      toast.success(`已读取 ${file.name}`)
+    } catch (err) {
+      toast.error('读取文件失败：' + extractErrorMessage(err))
+    }
+  }
 
   const resetForm = () => {
     setJsonInput('')
@@ -194,25 +209,37 @@ export function KamImportDialog({ open, onOpenChange, onJobStart }: KamImportDia
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7"
+                disabled={submitting}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                选择文件
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,.txt,application/json,text/plain"
+                className="hidden"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0]
+                  if (file) await readFile(file)
+                  e.target.value = '' // 允许重复选同一文件
+                }}
+              />
+            </div>
             <div
               onDragOver={(e) => { e.preventDefault(); e.stopPropagation() }}
               onDrop={async (e) => {
                 e.preventDefault(); e.stopPropagation()
                 if (submitting) return
                 const file = e.dataTransfer.files?.[0]
-                if (!file) return
-                if (!/\.(json|txt)$/i.test(file.name) && file.type && !file.type.includes('json') && !file.type.includes('text')) {
-                  toast.error('仅支持 .json / 文本文件')
-                  return
-                }
-                try {
-                  const text = await file.text()
-                  setJsonInput(text)
-                  toast.success(`已读取 ${file.name}`)
-                } catch (err) {
-                  toast.error('读取文件失败：' + extractErrorMessage(err))
-                }
+                if (file) await readFile(file)
               }}
             >
               <textarea
@@ -223,7 +250,7 @@ export function KamImportDialog({ open, onOpenChange, onJobStart }: KamImportDia
                 className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
               />
             </div>
-            <p className="text-xs text-muted-foreground">💡 拖入 .json 文件可直接读取 · 提交后后台处理，可关闭此窗口</p>
+            <p className="text-xs text-muted-foreground">💡 点「选择文件」或拖入 .json 文件 · 提交后后台处理，可关闭此窗口</p>
           </div>
 
           {/* 解析预览 */}

@@ -1031,61 +1031,111 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
             {compactMode ? (
-              /* 紧凑视图：每号一行，仅显示标题 + 双进度条 */
-              <div className="flex flex-col gap-1">
-                {currentCredentials.map((credential) => {
-                  const bal = balanceMap.get(credential.id) || null
-                  const limit = bal?.usageLimit ?? 0
-                  const used = bal?.currentUsage ?? 0
-                  const baseRemaining = Math.max(0, limit - used)
-                  const basePercent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
-                  const overCap = bal?.overageCap ?? 0
-                  const overUsed = Math.max(0, used - limit)
-                  const overRemaining = Math.max(0, overCap - overUsed)
-                  const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
-                  const disabled = credential.disabled
-                  const label = credential.email
-                    ? credential.email.split('@')[0]
-                    : `#${credential.id}`
-                  return (
-                    <div
-                      key={credential.id}
-                      className={`flex items-center gap-2 px-2 py-1 rounded border text-xs ${disabled ? 'opacity-50' : ''} ${selectedIds.has(credential.id) ? 'border-primary bg-primary/5' : 'border-border'}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.has(credential.id)}
-                        onChange={() => toggleSelect(credential.id)}
-                        className="h-3.5 w-3.5 shrink-0 cursor-pointer"
-                      />
-                      <span className="w-28 shrink-0 truncate font-mono text-muted-foreground" title={credential.email || String(credential.id)}>
-                        {label}
-                      </span>
-                      <div className="flex-1 flex flex-col gap-0.5">
-                        <div className="flex items-center gap-1">
-                          <span className="w-8 text-right tabular-nums text-muted-foreground">{limit > 0 ? Math.round(baseRemaining) : '—'}</span>
-                          <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
-                            <div
-                              className={`h-full rounded-full transition-all ${basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-yellow-500' : 'bg-primary'}`}
-                              style={{ width: `${basePercent}%` }}
-                            />
-                          </div>
+              /* 紧凑视图：KAM 风格表格 — 邮箱/来源/订阅/配额(主+超额双条)/状态/过期/分组 */
+              <div className="rounded-lg border border-border overflow-hidden">
+                {/* 表头 */}
+                <div className="flex items-center gap-2 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
+                  <span className="w-4 shrink-0" />
+                  <span className="w-44 shrink-0">邮箱</span>
+                  <span className="w-20 shrink-0">来源</span>
+                  <span className="w-24 shrink-0">订阅</span>
+                  <span className="flex-1 min-w-[160px]">配额</span>
+                  <span className="w-16 shrink-0 text-center">状态</span>
+                  <span className="w-28 shrink-0">过期 / 试用</span>
+                  <span className="w-20 shrink-0">分组</span>
+                </div>
+                {/* 行 */}
+                <div className="divide-y divide-border">
+                  {currentCredentials.map((credential) => {
+                    const bal = balanceMap.get(credential.id) || null
+                    const limit = bal?.usageLimit ?? 0
+                    const used = bal?.currentUsage ?? 0
+                    const baseRemaining = Math.max(0, limit - used)
+                    const basePercent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
+                    const overCap = bal?.overageCap ?? 0
+                    const overUsed = Math.max(0, used - limit)
+                    const overRemaining = Math.max(0, overCap - overUsed)
+                    const overPercent = overCap > 0 ? Math.min(100, (overUsed / overCap) * 100) : 0
+                    const overageOn = bal?.overageStatus === 'ENABLED'
+                    const disabled = credential.disabled
+                    const label = credential.email || `#${credential.id}`
+                    const sub = bal?.subscriptionTitle || null
+                    return (
+                      <div
+                        key={credential.id}
+                        className={`flex items-center gap-2 px-3 py-2 text-xs transition-colors ${disabled ? 'opacity-50' : ''} ${selectedIds.has(credential.id) ? 'bg-primary/5' : 'hover:bg-muted/30'}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(credential.id)}
+                          onChange={() => toggleSelect(credential.id)}
+                          className="h-3.5 w-3.5 shrink-0 cursor-pointer"
+                        />
+                        {/* 邮箱 + 标签 */}
+                        <div className="w-44 shrink-0 min-w-0">
+                          <div className="truncate font-mono text-foreground" title={credential.email || String(credential.id)}>{label}</div>
                         </div>
-                        {(overCap > 0 || overUsed > 0) && (
-                          <div className="flex items-center gap-1">
-                            <span className="w-8 text-right tabular-nums text-muted-foreground">{overCap > 0 ? Math.round(overRemaining) : '—'}</span>
-                            <div className="flex-1 h-2 rounded-full bg-secondary overflow-hidden">
+                        {/* 来源 */}
+                        <div className="w-20 shrink-0">
+                          {credential.source
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-secondary text-muted-foreground truncate max-w-full" title={credential.source}>{credential.source}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 订阅 */}
+                        <div className="w-24 shrink-0">
+                          {sub
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-medium truncate max-w-full" title={sub}>{sub}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
+                        {/* 配额：主条 + 超额条 */}
+                        <div className="flex-1 min-w-[160px] flex flex-col gap-1">
+                          <div className="flex items-center gap-2">
+                            <span className="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+                              {limit > 0 ? <><span className="text-foreground font-medium">{Math.round(baseRemaining)}</span>/{limit}</> : '—'}
+                            </span>
+                            <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
                               <div
-                                className={`h-full rounded-full transition-all ${overPercent >= 90 ? 'bg-destructive' : 'bg-yellow-500'}`}
-                                style={{ width: `${overPercent}%` }}
+                                className={`h-full rounded-full transition-all ${basePercent >= 90 ? 'bg-destructive' : basePercent >= 70 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                                style={{ width: `${basePercent}%` }}
                               />
                             </div>
                           </div>
-                        )}
+                          {(overCap > 0 || overageOn) && (
+                            <div className="flex items-center gap-2">
+                              <span className="w-20 shrink-0 text-right tabular-nums text-yellow-600 dark:text-yellow-500 flex items-center justify-end gap-0.5">
+                                ⚡{overCap > 0 ? <><span className="font-medium">{Math.round(overRemaining)}</span>/{overCap}</> : '已开'}
+                              </span>
+                              <div className="flex-1 h-1.5 rounded-full bg-secondary overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all ${overPercent >= 90 ? 'bg-destructive' : 'bg-yellow-500'}`}
+                                  style={{ width: `${overPercent}%` }}
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        {/* 状态 */}
+                        <div className="w-16 shrink-0 text-center">
+                          {disabled
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-destructive/15 text-destructive">禁用</span>
+                            : <span className="inline-block px-1.5 py-0.5 rounded bg-green-500/15 text-green-600 dark:text-green-500">正常</span>}
+                        </div>
+                        {/* 过期 / 试用 */}
+                        <div className="w-28 shrink-0 tabular-nums text-muted-foreground truncate" title={credential.expiresAt || ''}>
+                          {credential.expiresAt
+                            ? new Date(credential.expiresAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                            : '—'}
+                        </div>
+                        {/* 分组 */}
+                        <div className="w-20 shrink-0">
+                          {credential.group
+                            ? <span className="inline-block px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-500 truncate max-w-full" title={credential.group}>{credential.group}</span>
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </div>
                       </div>
-                    </div>
-                  )
-                })}
+                    )
+                  })}
+                </div>
               </div>
             ) : (
               /* 详细视图：原卡片网格 */
