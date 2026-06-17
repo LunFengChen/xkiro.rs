@@ -635,7 +635,7 @@ export function CredentialCard({
                 handleSetProxy(v === '' ? null : parseInt(v, 10))
               }}
               className="h-6 max-w-[60%] rounded-md border border-input bg-background px-1.5 text-2xs"
-              title={boundProxy ? boundProxy.url : '未绑定代理池'}
+              title={boundProxy ? `${boundProxy.region ? boundProxy.region + ' · ' : ''}${boundProxy.url}` : '未绑定代理池'}
             >
               <option value="">未绑定</option>
               {boundProxy == null && credential.proxyId != null && (
@@ -643,12 +643,32 @@ export function CredentialCard({
                   #{credential.proxyId}（已失效）
                 </option>
               )}
-              {proxyData?.proxies.map((p) => (
-                <option key={p.id} value={String(p.id)}>
-                  {(p.region ? `${p.region} · ` : '') + p.url}
-                  {p.dead ? '（离线）' : ''}
-                </option>
-              ))}
+              {/* 按 region 分组：有 region 的用 optgroup，无 region 的放"未分组" */}
+              {(() => {
+                const proxies = proxyData?.proxies ?? []
+                // 建分组 map，保持插入顺序；有名分组先，未分组最后
+                const groups = new Map<string, typeof proxies>()
+                for (const p of proxies) {
+                  const key = p.region?.trim() || '未分组'
+                  if (!groups.has(key)) groups.set(key, [])
+                  groups.get(key)!.push(p)
+                }
+                // 排序：命名分组按字母，未分组置尾
+                const sorted = [...groups.entries()].sort(([a], [b]) => {
+                  if (a === '未分组') return 1
+                  if (b === '未分组') return -1
+                  return a.localeCompare(b)
+                })
+                return sorted.map(([group, items]) => (
+                  <optgroup key={group} label={group}>
+                    {items.map((p) => (
+                      <option key={p.id} value={String(p.id)}>
+                        {p.url}{p.dead ? '（离线）' : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))
+              })()}
             </select>
           </div>
 
