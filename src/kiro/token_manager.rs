@@ -2640,7 +2640,7 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
+                    has_proxy: e.credentials.proxy_url.is_some() || e.credentials.proxy_id.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     proxy_id: e.credentials.proxy_id,
                     refresh_failure_count: e.refresh_failure_count,

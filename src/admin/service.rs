@@ -2849,13 +2849,14 @@ impl AdminService {
             }
 
             // 候选:启用 + 未 dead;region 匹配(相同 region) 或代理无 region(通配)
+            // 号无 region(导入时未填)也兜底分配任意可用代理，按负载均摊
             let mut candidates: Vec<u64> = proxies
                 .iter()
                 .filter(|v| !v.entry.disabled && !v.health.dead)
                 .filter(|v| match (&region, &v.entry.region) {
                     (Some(cr), Some(pr)) => cr == pr,
-                    (_, None) => true, // 代理无 region = 通配兜底
-                    (None, Some(_)) => false, // 号无 region 不配给特定 region 代理
+                    (_, None) => true,       // 代理无 region = 通配兜底
+                    (None, Some(_)) => true, // 号无 region = 兜底分配任意可用代理
                 })
                 .filter_map(|v| v.entry.id)
                 .collect();

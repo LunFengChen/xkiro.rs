@@ -622,10 +622,12 @@ export function CredentialCard({
               <span className="font-mono text-2xs">{credential.maskedApiKey}</span>
             </div>
           )}
-          {credential.hasProxy && credential.proxyUrl && (
+          {credential.hasProxy && (credential.proxyUrl || boundProxy) && (
             <div className="col-span-2 flex items-center justify-between gap-2">
               <span className="text-muted-foreground">代理</span>
-              <span className="truncate font-mono text-2xs" title={credential.proxyUrl}>{credential.proxyUrl}</span>
+              <span className="truncate font-mono text-2xs" title={credential.proxyUrl ?? boundProxy?.url}>
+                {boundProxy ? `${boundProxy.region ?? ''} · ${boundProxy.url}` : credential.proxyUrl}
+              </span>
             </div>
           )}
           {/* 代理池绑定：按 region 选择，后端自动挑该 region 下负载最低的代理 */}
