@@ -738,7 +738,12 @@ fn next_retry_at_for(
         return None;
     }
     match reason {
-        Some(DisabledReason::Manual) | Some(DisabledReason::InvalidConfig) | None => return None,
+        Some(DisabledReason::Manual)
+        | Some(DisabledReason::InvalidConfig)
+        | Some(DisabledReason::InsufficientBalance)
+        | Some(DisabledReason::AuthenticationFailed)
+        | Some(DisabledReason::AccountSuspended)
+        | None => return None,
         _ => {}
     }
     let disabled_at = disabled_at?;
@@ -3636,9 +3641,14 @@ impl MultiTokenManager {
                 if !entry.disabled {
                     continue;
                 }
-                // 仅自动禁用参与重试；Manual / InvalidConfig 豁免
+                // 仅自动禁用参与重试；永久性故障 reason 豁免
                 match entry.disabled_reason {
-                    Some(DisabledReason::Manual) | Some(DisabledReason::InvalidConfig) | None => {
+                    Some(DisabledReason::Manual)
+                    | Some(DisabledReason::InvalidConfig)
+                    | Some(DisabledReason::InsufficientBalance)
+                    | Some(DisabledReason::AuthenticationFailed)
+                    | Some(DisabledReason::AccountSuspended)
+                    | None => {
                         continue;
                     }
                     _ => {}
