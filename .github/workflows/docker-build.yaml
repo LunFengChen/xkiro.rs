@@ -20,6 +20,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     outputs:
       sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      owner: ${{ steps.meta.outputs.owner }}
 
     strategy:
       fail-fast: false
@@ -45,6 +46,8 @@ jobs:
           else
             echo "sha_tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           fi
+          # ghcr.io 要求全小写
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -65,7 +68,7 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/xkiro-rs:${{ steps.meta.outputs.sha_tag }}-${{ matrix.arch }}
+          tags: ghcr.io/${{ steps.meta.outputs.owner }}/xkiro-rs:${{ steps.meta.outputs.sha_tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=xkiro-rs Docker Image
@@ -84,7 +87,7 @@ jobs:
       - name: Create and push multi-arch manifest
         run: |
           SHA_TAG="${{ needs.build.outputs.sha_tag }}"
-          IMAGE="ghcr.io/${{ github.repository_owner }}/xkiro-rs"
+          IMAGE="ghcr.io/${{ needs.build.outputs.owner }}/xkiro-rs"
 
           # sha/version 标签的 manifest
           docker manifest create ${IMAGE}:${SHA_TAG} \
