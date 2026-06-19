@@ -22,6 +22,152 @@ use model::arg::{Args, Command};
 use model::config::Config;
 use parking_lot::RwLock;
 
+fn format_count_map(counts: std::collections::BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "<empty>".to_string();
+    }
+    counts
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn log_startup_diagnostics(
+    config: &Config,
+    config_path: &str,
+    credentials_path: &str,
+    credentials: &[KiroCredentials],
+    endpoint_names: &[String],
+) {
+    let mut endpoint_counts = std::collections::BTreeMap::new();
+    let mut group_counts = std::collections::BTreeMap::new();
+    let mut source_counts = std::collections::BTreeMap::new();
+    let mut api_region_counts = std::collections::BTreeMap::new();
+    let mut auth_region_counts = std::collections::BTreeMap::new();
+    let mut subscription_counts = std::collections::BTreeMap::new();
+
+    let mut disabled_count = 0usize;
+    let mut api_key_count = 0usize;
+    let mut oauth_count = 0usize;
+    let mut with_proxy_id_count = 0usize;
+    let mut with_proxy_url_count = 0usize;
+    let mut supports_opus_count = 0usize;
+    let mut explicit_endpoint_count = 0usize;
+
+    for cred in credentials {
+        if cred.disabled {
+            disabled_count += 1;
+        }
+        if cred.is_api_key_credential() {
+            api_key_count += 1;
+        } else {
+            oauth_count += 1;
+        }
+        if cred.proxy_id.is_some() {
+            with_proxy_id_count += 1;
+        }
+        if cred.proxy_url.is_some() {
+            with_proxy_url_count += 1;
+        }
+        if cred.supports_opus() {
+            supports_opus_count += 1;
+        }
+        if cred.endpoint.is_some() {
+            explicit_endpoint_count += 1;
+        }
+
+        *endpoint_counts
+            .entry(
+                cred.endpoint
+                    .as_deref()
+                    .unwrap_or(&config.default_endpoint)
+                    .to_string(),
+            )
+            .or_insert(0) += 1;
+        *group_counts
+            .entry(cred.group.as_deref().unwrap_or("<none>").to_string())
+            .or_insert(0) += 1;
+        *source_counts
+            .entry(cred.source.as_deref().unwrap_or("<none>").to_string())
+            .or_insert(0) += 1;
+        *api_region_counts
+            .entry(cred.effective_api_region(config).to_string())
+            .or_insert(0) += 1;
+        *auth_region_counts
+            .entry(cred.effective_auth_region(config).to_string())
+            .or_insert(0) += 1;
+
+        let subscription_key = match cred.subscription_title.as_deref() {
+            Some(title) if title.to_uppercase().contains("FREE") => "free",
+            Some(_) => "paid_or_named",
+            None => "<unknown>",
+        };
+        *subscription_counts
+            .entry(subscription_key.to_string())
+            .or_insert(0) += 1;
+    }
+
+    let registered_endpoints = {
+        let mut names = endpoint_names.to_vec();
+        names.sort();
+        names.join(",")
+    };
+    let global_proxy_url = config
+        .proxy_url
+        .as_deref()
+        .map(crate::common::redact::mask_url_userinfo)
+        .unwrap_or_else(|| "<none>".to_string());
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        config_path,
+        credentials_path,
+        host = %config.host,
+        port = config.port,
+        default_endpoint = %config.default_endpoint,
+        registered_endpoints = %registered_endpoints,
+        tls_backend = ?config.tls_backend,
+        kiro_version = %config.kiro_version,
+        system_version = %config.system_version,
+        node_version = %config.node_version,
+        global_proxy_url = %global_proxy_url,
+        per_credential_concurrency = config.per_credential_concurrency,
+        global_concurrency = config.global_concurrency,
+        acquire_wait_timeout_secs = config.acquire_wait_timeout_secs,
+        session_affinity_enabled = config.session_affinity_enabled,
+        balance_refresh_enabled = config.balance_refresh_enabled,
+        balance_refresh_interval_secs = config.balance_refresh_interval_secs,
+        balance_refresh_concurrency = config.balance_refresh_concurrency,
+        prompt_cache_accounting_enabled = config.prompt_cache_accounting_enabled,
+        prompt_cache_ttl_seconds = config.prompt_cache_ttl_seconds,
+        compression_enabled = config.compression.enabled,
+        max_request_body_bytes = config.compression.max_request_body_bytes,
+        precise_token_counting = config.precise_token_counting,
+        "xkiro 启动诊断配置"
+    );
+
+    tracing::info!(
+        total_credentials = credentials.len(),
+        disabled_credentials = disabled_count,
+        enabled_credentials = credentials.len().saturating_sub(disabled_count),
+        api_key_credentials = api_key_count,
+        oauth_credentials = oauth_count,
+        supports_opus_credentials = supports_opus_count,
+        with_proxy_id = with_proxy_id_count,
+        with_proxy_url = with_proxy_url_count,
+        explicit_endpoint_credentials = explicit_endpoint_count,
+        endpoint_counts = %format_count_map(endpoint_counts),
+        group_counts = %format_count_map(group_counts),
+        source_counts = %format_count_map(source_counts),
+        api_region_counts = %format_count_map(api_region_counts),
+        auth_region_counts = %format_count_map(auth_region_counts),
+        subscription_counts = %format_count_map(subscription_counts),
+        "xkiro 启动凭据摘要"
+    );
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -46,6 +192,11 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        "xkiro-rs 进程启动"
+    );
 
     // 加载配置：文件不存在则进交互式向导（运行 init 流程后再加载）
     let config_path = args
@@ -152,6 +303,13 @@ async fn main() {
     }
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    log_startup_diagnostics(
+        &config,
+        &config_path,
+        &credentials_path,
+        &credentials_list,
+        &endpoint_names,
+    );
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -181,10 +339,34 @@ async fn main() {
         }),
     );
     token_manager.set_proxy_manager(Arc::clone(&proxy_manager));
+    let proxy_views = proxy_manager.list();
+    let proxy_total = proxy_views.len();
+    let proxy_disabled = proxy_views.iter().filter(|p| p.entry.disabled).count();
+    let proxy_dead = proxy_views.iter().filter(|p| p.health.dead).count();
+    let proxy_with_auth = proxy_views
+        .iter()
+        .filter(|p| p.entry.username.is_some() || p.entry.password.is_some())
+        .count();
+    let proxy_with_limit = proxy_views
+        .iter()
+        .filter(|p| p.entry.max_concurrency.unwrap_or(0) > 0)
+        .count();
+    let mut proxy_region_counts = std::collections::BTreeMap::new();
+    for p in &proxy_views {
+        *proxy_region_counts
+            .entry(p.entry.region.as_deref().unwrap_or("<none>").to_string())
+            .or_insert(0) += 1;
+    }
     tracing::info!(
-        "代理池已加载: {} 条 ({})",
-        proxy_manager.list().len(),
-        proxies_path.display()
+        proxy_total,
+        proxy_enabled = proxy_total.saturating_sub(proxy_disabled),
+        proxy_disabled,
+        proxy_dead,
+        proxy_with_auth,
+        proxy_with_limit,
+        proxy_region_counts = %format_count_map(proxy_region_counts),
+        proxies_path = %proxies_path.display(),
+        "代理池已加载"
     );
 
     // 启动后台 Token 刷新任务（默认配置：每 60s 检查一次，提前 15 分钟刷新）

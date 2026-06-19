@@ -489,8 +489,22 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx)?;
-            tracing::debug!(
+            let body = match endpoint.transform_api_body(request_body, &rctx) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::error!(
+                        api_type = %api_type,
+                        credential_id = ctx.id,
+                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        endpoint = endpoint.name(),
+                        error = %e,
+                        "{} API endpoint 请求体转换失败",
+                        api_type
+                    );
+                    return Err(e);
+                }
+            };
+            tracing::info!(
                 api_type = %api_type,
                 credential_id = ctx.id,
                 model_id = model.as_deref().unwrap_or("<unknown>"),
@@ -501,8 +515,25 @@ impl KiroProvider {
                 api_type
             );
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::error!(
+                        api_type = %api_type,
+                        credential_id = ctx.id,
+                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        endpoint = endpoint.name(),
+                        proxy_id = ?ctx.credentials.proxy_id,
+                        has_effective_proxy = effective_proxy.is_some(),
+                        error = %e,
+                        "{} API HTTP client 构建失败",
+                        api_type
+                    );
+                    return Err(e);
+                }
+            };
+
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -513,10 +544,17 @@ impl KiroProvider {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        api_type = %api_type,
+                        attempt = attempt + 1,
                         max_retries,
-                        e
+                        credential_id = ctx.id,
+                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        endpoint = endpoint.name(),
+                        proxy_id = ?ctx.credentials.proxy_id,
+                        has_effective_proxy = effective_proxy.is_some(),
+                        error = %e,
+                        "{} API 请求发送失败",
+                        api_type
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
@@ -710,13 +748,23 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
+        let final_error = last_error.unwrap_or_else(|| {
             anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
                 max_retries
             )
-        }))
+        });
+        tracing::error!(
+            api_type = %api_type,
+            model_id = model.as_deref().unwrap_or("<unknown>"),
+            total_credentials,
+            max_retries,
+            error = %final_error,
+            "{} API 调用最终失败",
+            api_type
+        );
+        Err(final_error)
     }
 
     /// 从请求体中提取模型信息

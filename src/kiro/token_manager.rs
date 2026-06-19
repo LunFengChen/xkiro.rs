@@ -1072,7 +1072,7 @@ impl MultiTokenManager {
                 model_matched_count,
             )
         };
-        tracing::debug!(
+        tracing::info!(
             model = model.unwrap_or("<none>"),
             group = group.unwrap_or("<none>"),
             total_credentials = total_entries,
@@ -1239,7 +1239,7 @@ impl MultiTokenManager {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        tracing::debug!(
+        tracing::info!(
             model = model.unwrap_or("<none>"),
             group = group.unwrap_or("<none>"),
             candidate_count = result.len(),
@@ -1343,9 +1343,10 @@ impl MultiTokenManager {
                     .unwrap_or(false)
             };
             if !usable {
-                tracing::debug!(
+                tracing::info!(
                     session = %sid,
                     credential_id = %bound_id,
+                    model = model.unwrap_or("<none>"),
                     "亲和命中但凭据已禁用 / 模型不允许，重选"
                 );
                 self.session_affinity.remove(sid);
@@ -1386,14 +1387,21 @@ impl MultiTokenManager {
                                 ctx._credential_permit = Some(per_cred_permit);
                                 ctx._global_permit = global_permit;
                                 self.session_affinity.touch(sid);
+                                tracing::info!(
+                                    session = %sid,
+                                    credential_id = %bound_id,
+                                    model = model.unwrap_or("<none>"),
+                                    "亲和命中，复用绑定凭据"
+                                );
                                 return Ok(ctx);
                             }
                             Err(e) => {
                                 drop(per_cred_permit);
                                 drop(global_permit);
-                                tracing::debug!(
+                                tracing::warn!(
                                     session = %sid,
                                     credential_id = %bound_id,
+                                    model = model.unwrap_or("<none>"),
                                     error = %e,
                                     "亲和绑定凭据 token 刷新失败，回退到 rank"
                                 );
@@ -1410,9 +1418,10 @@ impl MultiTokenManager {
                         drop(per_cred_permit);
                     }
                 } else {
-                    tracing::debug!(
+                    tracing::info!(
                         session = %sid,
                         credential_id = %bound_id,
+                        model = model.unwrap_or("<none>"),
                         "亲和绑定凭据 sema 满，本次分流（保留绑定）"
                     );
                     // 保留绑定：分流到 rank 选出的其他凭据，但不覆盖 affinity 映射，
@@ -1425,6 +1434,12 @@ impl MultiTokenManager {
         // 未命中 / 凭据不可用 / token 刷新失败：rank 选 + 建立（或覆盖到新）绑定
         let ctx = self.acquire_context(model, group).await?;
         self.session_affinity.set(sid, ctx.id);
+        tracing::info!(
+            session = %sid,
+            credential_id = ctx.id,
+            model = model.unwrap_or("<none>"),
+            "已建立 session 亲和绑定"
+        );
         Ok(ctx)
     }
 
