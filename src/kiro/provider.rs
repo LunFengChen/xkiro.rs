@@ -398,6 +398,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut invalid_model_credentials: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -418,7 +419,12 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_for_session(user_id, model.as_deref(), group)
+                .acquire_context_for_session_excluding(
+                    user_id,
+                    model.as_deref(),
+                    group,
+                    Some(&invalid_model_credentials),
+                )
                 .await
             {
                 Ok(c) => c,
@@ -646,7 +652,37 @@ impl KiroProvider {
                         "{} API 400 Bad Request - 输入上下文过长",
                         api_type
                     );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, redacted_body);
                 }
+
+                if Self::is_invalid_model_id(&body) {
+                    invalid_model_credentials.insert(ctx.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        redacted_body
+                    ));
+                    tracing::warn!(
+                        api_type = %api_type,
+                        credential_id = ctx.id,
+                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        excluded_credentials = invalid_model_credentials.len(),
+                        total_credentials,
+                        "凭据不支持该模型，本次请求跳过该凭据并切换下一凭据"
+                    );
+                    if invalid_model_credentials.len() < total_credentials && attempt + 1 < max_retries {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "{} API 请求失败（所有可尝试凭据均不支持模型 {}）: {} {}",
+                        api_type,
+                        model.as_deref().unwrap_or("<unknown>"),
+                        status,
+                        redacted_body
+                    );
+                }
+
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, redacted_body);
             }
 
@@ -781,6 +817,30 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 检测响应体是否表示「当前凭据/出口不支持请求模型」。
+    fn is_invalid_model_id(body: &str) -> bool {
+        if body.contains("INVALID_MODEL_ID") {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        if value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "INVALID_MODEL_ID")
+        {
+            return true;
+        }
+
+        value
+            .pointer("/error/reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "INVALID_MODEL_ID")
     }
 
     /// 检测响应体是否表示「模型暂时不可用」

@@ -12,7 +12,7 @@ use futures::future::select_all;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1025,7 +1025,12 @@ impl MultiTokenManager {
     /// 7. 完整 6 元组相同的段：rr 轮转，公平分摊。
     ///
     /// acquire_context 拿到列表后挨个 `try_acquire_owned`，第一个抢到 permit 的就用。
-    fn rank_candidates(&self, model: Option<&str>, group: Option<&str>) -> Vec<u64> {
+    fn rank_candidates(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: Option<&HashSet<u64>>,
+    ) -> Vec<u64> {
         // 1. 过滤可用候选
         let (candidate_ids, total_entries, enabled_count, group_matched_count, model_matched_count): (
             Vec<u64>,
@@ -1044,6 +1049,9 @@ impl MultiTokenManager {
             let mut model_matched_count = 0usize;
             let mut candidate_ids = Vec::new();
             for e in entries.iter() {
+                if excluded.is_some_and(|ids| ids.contains(&e.id)) {
+                    continue;
+                }
                 if e.disabled {
                     continue;
                 }
@@ -1080,6 +1088,7 @@ impl MultiTokenManager {
             group_matched_credentials = group_matched_count,
             model_matched_credentials = model_matched_count,
             candidate_count = candidate_ids.len(),
+            excluded_credentials = excluded.map(|ids| ids.len()).unwrap_or(0),
             "凭据候选过滤完成"
         );
 
@@ -1091,7 +1100,8 @@ impl MultiTokenManager {
                 enabled_credentials = enabled_count,
                 group_matched_credentials = group_matched_count,
                 model_matched_credentials = model_matched_count,
-                "无可用凭据候选：请检查账号是否启用、API key 分组是否匹配、模型是否被账号支持"
+                excluded_credentials = excluded.map(|ids| ids.len()).unwrap_or(0),
+                "无可用凭据候选：请检查账号是否启用、API key 分组是否匹配、模型是否被账号支持，或本次请求已排除部分凭据"
             );
             return Vec::new();
         }
@@ -1243,6 +1253,7 @@ impl MultiTokenManager {
             model = model.unwrap_or("<none>"),
             group = group.unwrap_or("<none>"),
             candidate_count = result.len(),
+            excluded_credentials = excluded.map(|ids| ids.len()).unwrap_or(0),
             top_candidate_ids = %preview,
             "凭据候选排序完成"
         );
@@ -1321,14 +1332,26 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_excluding(session_id, model, group, None)
+            .await
+    }
+
+    /// 按 session_id 亲和获取调用上下文，并排除本次请求已经失败的凭据。
+    pub async fn acquire_context_for_session_excluding(
+        &self,
+        session_id: Option<&str>,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: Option<&HashSet<u64>>,
+    ) -> anyhow::Result<CallContext> {
         // 全局 session 亲和开关：关闭时每条消息独立走 rank，多号天然平摊
         if !self.config.read().session_affinity_enabled {
-            return self.acquire_context(model, group).await;
+            return self.acquire_context_excluding(model, group, excluded).await;
         }
 
         let sid = match session_id {
             Some(s) if !s.is_empty() => s,
-            _ => return self.acquire_context(model, group).await,
+            _ => return self.acquire_context_excluding(model, group, excluded).await,
         };
 
         // 命中亲和绑定 → 校验后尝试复用
@@ -1339,7 +1362,10 @@ impl MultiTokenManager {
                 entries
                     .iter()
                     .find(|e| e.id == bound_id && !e.disabled)
-                    .map(|e| Self::credential_supports_model(e, model))
+                    .map(|e| {
+                        !excluded.is_some_and(|ids| ids.contains(&bound_id))
+                            && Self::credential_supports_model(e, model)
+                    })
                     .unwrap_or(false)
             };
             if !usable {
@@ -1426,13 +1452,13 @@ impl MultiTokenManager {
                     );
                     // 保留绑定：分流到 rank 选出的其他凭据，但不覆盖 affinity 映射，
                     // 等下次该 session 请求时再尝试黏回原凭据。
-                    return self.acquire_context(model, group).await;
+                    return self.acquire_context_excluding(model, group, excluded).await;
                 }
             }
         }
 
         // 未命中 / 凭据不可用 / token 刷新失败：rank 选 + 建立（或覆盖到新）绑定
-        let ctx = self.acquire_context(model, group).await?;
+        let ctx = self.acquire_context_excluding(model, group, excluded).await?;
         self.session_affinity.set(sid, ctx.id);
         tracing::info!(
             session = %sid,
@@ -1464,6 +1490,16 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(model, group, None).await
+    }
+
+    /// 获取 API 调用上下文，并排除本次请求已经失败的凭据。
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded: Option<&HashSet<u64>>,
+    ) -> anyhow::Result<CallContext> {
         // 检查是否需要自动恢复（5 分钟全局禁用）
         self.check_and_recover();
 
@@ -1485,7 +1521,7 @@ impl MultiTokenManager {
             }
 
             // 1. 收集候选（统一加权排序：priority asc, recent_usage asc, remaining desc）
-            let mut candidates = self.rank_candidates(model, group);
+            let mut candidates = self.rank_candidates(model, group, excluded);
 
             // 候选为空：尝试 TooManyFailures 自愈（等价于重启）
             if candidates.is_empty() {
@@ -1504,7 +1540,7 @@ impl MultiTokenManager {
                         }
                     }
                     drop(entries);
-                    candidates = self.rank_candidates(model, group);
+                    candidates = self.rank_candidates(model, group, excluded);
                 }
             }
 
