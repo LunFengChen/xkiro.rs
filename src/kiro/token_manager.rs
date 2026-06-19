@@ -3051,6 +3051,75 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 为指定凭据选择一个替代代理。
+    ///
+    /// 策略：排除本次已证明不支持模型的代理；优先同 region，其次任意健康代理；
+    /// 同档按绑定负载低、可用并发高排序。
+    pub fn choose_replacement_proxy(
+        &self,
+        credential_id: u64,
+        excluded_proxy_ids: &HashSet<u64>,
+    ) -> Option<u64> {
+        let (credential_region, current_proxy_id) = {
+            let entries = self.entries.lock();
+            let entry = entries.iter().find(|e| e.id == credential_id && !e.disabled)?;
+            (entry.credentials.region.clone(), entry.credentials.proxy_id)
+        };
+
+        let pm = self.proxy_manager()?;
+        let proxies = pm.list();
+        let bindings = self.credential_region_bindings();
+        let mut load: HashMap<u64, usize> = HashMap::new();
+        for (_, _, pid, disabled) in bindings {
+            if disabled {
+                continue;
+            }
+            if let Some(pid) = pid {
+                *load.entry(pid).or_insert(0) += 1;
+            }
+        }
+
+        let mut candidates: Vec<_> = proxies
+            .into_iter()
+            .filter(|v| !v.entry.disabled && !v.health.dead)
+            .filter_map(|v| {
+                let id = v.entry.id?;
+                if excluded_proxy_ids.contains(&id) || Some(id) == current_proxy_id {
+                    return None;
+                }
+                let region_mismatch =
+                    match (credential_region.as_deref(), v.entry.region.as_deref()) {
+                        (Some(cr), Some(pr)) => cr != pr,
+                        // 无 region 的代理视为通配，也可用于跨区探测。
+                        _ => false,
+                    };
+                let current_load = *load.get(&id).unwrap_or(&0);
+                let available_permits = v.available_permits.unwrap_or(usize::MAX);
+                Some((
+                    id,
+                    region_mismatch,
+                    current_load,
+                    std::cmp::Reverse(available_permits),
+                ))
+            })
+            .collect();
+
+        candidates.sort_by_key(|(_, region_mismatch, current_load, available)| {
+            (*region_mismatch, *current_load, *available)
+        });
+        let chosen = candidates.first().map(|(id, _, _, _)| *id);
+        tracing::info!(
+            credential_id,
+            current_proxy_id = ?current_proxy_id,
+            credential_region = credential_region.as_deref().unwrap_or("<none>"),
+            excluded_proxy_count = excluded_proxy_ids.len(),
+            candidate_count = candidates.len(),
+            chosen_proxy_id = ?chosen,
+            "选择替代代理用于模型探测"
+        );
+        chosen
+    }
+
     /// 设置指定凭据的路由分组标签（Admin API）
     ///
     /// 传 `None` 或空字符串表示清除分组，账号参与所有未限制的请求。

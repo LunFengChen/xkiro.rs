@@ -8,7 +8,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 
@@ -51,6 +51,16 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 当前凭据/代理组合不支持某模型的本地缓存 TTL。
+const UNSUPPORTED_MODEL_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnsupportedModelKey {
+    credential_id: u64,
+    model_id: String,
+    proxy_id: Option<u64>,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -73,6 +83,8 @@ pub struct KiroProvider {
     ///
     /// 使用 RwLock 包裹以支持运行时热更新（贴合 BK provider.rs:111）
     default_endpoint: RwLock<String>,
+    /// 短 TTL 缓存：credential + model + proxy 组合被上游判定 INVALID_MODEL_ID。
+    unsupported_model_cache: Mutex<HashMap<UnsupportedModelKey, Instant>>,
 }
 
 impl KiroProvider {
@@ -108,6 +120,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint: RwLock::new(default_endpoint),
+            unsupported_model_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -195,6 +208,50 @@ impl KiroProvider {
     /// 例如 metering 透传后 `apply_credit_usage`）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
+    }
+
+    fn prune_unsupported_model_cache_locked(cache: &mut HashMap<UnsupportedModelKey, Instant>) {
+        let now = Instant::now();
+        cache.retain(|_, expires_at| *expires_at > now);
+    }
+
+    fn mark_unsupported_model_combo(
+        &self,
+        credential_id: u64,
+        model_id: &str,
+        proxy_id: Option<u64>,
+    ) {
+        let mut cache = self.unsupported_model_cache.lock();
+        Self::prune_unsupported_model_cache_locked(&mut cache);
+        cache.insert(
+            UnsupportedModelKey {
+                credential_id,
+                model_id: model_id.to_string(),
+                proxy_id,
+            },
+            Instant::now() + UNSUPPORTED_MODEL_CACHE_TTL,
+        );
+        tracing::warn!(
+            credential_id,
+            model_id,
+            proxy_id = ?proxy_id,
+            ttl_secs = UNSUPPORTED_MODEL_CACHE_TTL.as_secs(),
+            "已缓存不支持的 credential/model/proxy 组合"
+        );
+    }
+
+    fn unsupported_proxy_ids_for_model(
+        &self,
+        credential_id: u64,
+        model_id: &str,
+    ) -> HashSet<u64> {
+        let mut cache = self.unsupported_model_cache.lock();
+        Self::prune_unsupported_model_cache_locked(&mut cache);
+        cache
+            .keys()
+            .filter(|k| k.credential_id == credential_id && k.model_id == model_id)
+            .filter_map(|k| k.proxy_id)
+            .collect()
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -656,20 +713,58 @@ impl KiroProvider {
                 }
 
                 if Self::is_invalid_model_id(&body) {
-                    invalid_model_credentials.insert(ctx.id);
+                    let model_id = model.as_deref().unwrap_or("<unknown>");
+                    let current_proxy_id = ctx.credentials.proxy_id;
+                    self.mark_unsupported_model_combo(ctx.id, model_id, current_proxy_id);
                     last_error = Some(anyhow::anyhow!(
                         "{} API 请求失败: {} {}",
                         api_type,
                         status,
                         redacted_body
                     ));
+
+                    let excluded_proxy_ids = self.unsupported_proxy_ids_for_model(ctx.id, model_id);
+                    if let Some(next_proxy_id) = self
+                        .token_manager
+                        .choose_replacement_proxy(ctx.id, &excluded_proxy_ids)
+                    {
+                        match self.token_manager.set_proxy_id(ctx.id, Some(next_proxy_id)) {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    api_type = %api_type,
+                                    credential_id = ctx.id,
+                                    model_id,
+                                    old_proxy_id = ?current_proxy_id,
+                                    new_proxy_id = next_proxy_id,
+                                    excluded_proxy_count = excluded_proxy_ids.len(),
+                                    "凭据当前出口不支持该模型，已自动换绑代理并重试"
+                                );
+                                if attempt + 1 < max_retries {
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    api_type = %api_type,
+                                    credential_id = ctx.id,
+                                    model_id,
+                                    next_proxy_id,
+                                    error = %e,
+                                    "自动换绑代理失败，改为切换其他凭据"
+                                );
+                            }
+                        }
+                    }
+
+                    invalid_model_credentials.insert(ctx.id);
                     tracing::warn!(
                         api_type = %api_type,
                         credential_id = ctx.id,
-                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        model_id,
+                        current_proxy_id = ?current_proxy_id,
                         excluded_credentials = invalid_model_credentials.len(),
                         total_credentials,
-                        "凭据不支持该模型，本次请求跳过该凭据并切换下一凭据"
+                        "该凭据暂无可用替代代理，本次请求跳过该凭据并切换下一凭据"
                     );
                     if invalid_model_credentials.len() < total_credentials && attempt + 1 < max_retries {
                         continue;
@@ -677,7 +772,7 @@ impl KiroProvider {
                     anyhow::bail!(
                         "{} API 请求失败（所有可尝试凭据均不支持模型 {}）: {} {}",
                         api_type,
-                        model.as_deref().unwrap_or("<unknown>"),
+                        model_id,
                         status,
                         redacted_body
                     );
