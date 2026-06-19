@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::sleep;
 
+use crate::common::redact::{mask_email, redact_secret_text};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
@@ -401,6 +402,17 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        tracing::info!(
+            api_type = %api_type,
+            model_id = model.as_deref().unwrap_or("<unknown>"),
+            total_credentials,
+            max_retries,
+            session_affinity = user_id.is_some(),
+            group = group.unwrap_or("<none>"),
+            request_body_bytes = request_body.len(),
+            "{} API 调用开始",
+            api_type
+        );
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -411,6 +423,16 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    tracing::warn!(
+                        api_type = %api_type,
+                        attempt = attempt + 1,
+                        max_retries,
+                        model_id = model.as_deref().unwrap_or("<unknown>"),
+                        group = group.unwrap_or("<none>"),
+                        error = %e,
+                        "{} API 获取可用凭据失败",
+                        api_type
+                    );
                     last_error = Some(e);
                     continue;
                 }
@@ -422,11 +444,42 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
+                    tracing::warn!(
+                        api_type = %api_type,
+                        credential_id = ctx.id,
+                        endpoint = ctx.credentials.endpoint.as_deref().unwrap_or("<default>"),
+                        error = %e,
+                        "{} API 凭据 endpoint 解析失败，切换下一凭据",
+                        api_type
+                    );
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
                     continue;
                 }
             };
+            let effective_proxy = ctx
+                .credentials
+                .effective_proxy(self.global_proxy.read().as_ref());
+            let masked_email = ctx.credentials.email.as_deref().map(mask_email);
+            tracing::info!(
+                api_type = %api_type,
+                attempt = attempt + 1,
+                max_retries,
+                credential_id = ctx.id,
+                model_id = model.as_deref().unwrap_or("<unknown>"),
+                endpoint = endpoint.name(),
+                auth_method = ctx.credentials.auth_method.as_deref().unwrap_or("<unknown>"),
+                auth_region = ctx.credentials.effective_auth_region(&config),
+                api_region = ctx.credentials.effective_api_region(&config),
+                subscription = ctx.credentials.subscription_title.as_deref().unwrap_or("<unknown>"),
+                email = masked_email.as_deref().unwrap_or("<none>"),
+                proxy_id = ?ctx.credentials.proxy_id,
+                has_effective_proxy = effective_proxy.is_some(),
+                credential_group = ctx.credentials.group.as_deref().unwrap_or("<none>"),
+                credential_source = ctx.credentials.source.as_deref().unwrap_or("<none>"),
+                "{} API 已选择凭据",
+                api_type
+            );
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -437,6 +490,16 @@ impl KiroProvider {
 
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx)?;
+            tracing::debug!(
+                api_type = %api_type,
+                credential_id = ctx.id,
+                model_id = model.as_deref().unwrap_or("<unknown>"),
+                endpoint = endpoint.name(),
+                request_body_bytes = request_body.len(),
+                transformed_body_bytes = body.len(),
+                "{} API 请求体已完成 endpoint 转换",
+                api_type
+            );
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -469,6 +532,15 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                tracing::info!(
+                    api_type = %api_type,
+                    status = %status,
+                    credential_id = ctx.id,
+                    model_id = model.as_deref().unwrap_or("<unknown>"),
+                    endpoint = endpoint.name(),
+                    "{} API 上游响应成功",
+                    api_type
+                );
                 self.token_manager.report_success(ctx.id);
                 // 后台异步刷新余额缓存（贴合 BK provider.rs:633）
                 self.spawn_balance_refresh(ctx.id);
@@ -482,6 +554,7 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            let redacted_body = redact_secret_text(&body);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -490,7 +563,7 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    redacted_body
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -499,7 +572,7 @@ impl KiroProvider {
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
-                        body
+                        redacted_body
                     );
                 }
 
@@ -507,25 +580,36 @@ impl KiroProvider {
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    redacted_body
                 ));
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                tracing::error!(
+                    api_type = %api_type,
+                    status = %status,
+                    credential_id = ctx.id,
+                    model_id = model.as_deref().unwrap_or("<unknown>"),
+                    attempt = attempt + 1,
+                    max_retries,
+                    response_body = %redacted_body,
+                    "{} API 400 Bad Request（上游拒绝请求）",
+                    api_type
+                );
                 if Self::is_input_too_long(&body) {
                     tracing::error!(
                         api_type = %api_type,
                         status = %status,
                         response_body_bytes = body.len(),
-                        request_url = %url,
+                        endpoint = endpoint.name(),
                         request_body_bytes = request_body.len(),
                         "{} API 400 Bad Request - 输入上下文过长",
                         api_type
                     );
                 }
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, redacted_body);
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -535,7 +619,7 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    redacted_body
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -555,7 +639,7 @@ impl KiroProvider {
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
-                        body
+                        redacted_body
                     );
                 }
 
@@ -563,7 +647,7 @@ impl KiroProvider {
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    redacted_body
                 ));
                 continue;
             }
@@ -576,7 +660,7 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries,
                     status,
-                    body
+                    redacted_body
                 );
                 // 检测 MODEL_TEMPORARILY_UNAVAILABLE 并触发全局熔断
                 if Self::is_model_temporarily_unavailable(&body)
@@ -586,14 +670,14 @@ impl KiroProvider {
                         "{} API 请求失败（模型暂时不可用，已触发熔断）: {} {}",
                         api_type,
                         status,
-                        body
+                        redacted_body
                     );
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
                     status,
-                    body
+                    redacted_body
                 ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -603,7 +687,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, redacted_body);
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -612,13 +696,13 @@ impl KiroProvider {
                 attempt + 1,
                 max_retries,
                 status,
-                body
+                redacted_body
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
                 api_type,
                 status,
-                body
+                redacted_body
             ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;

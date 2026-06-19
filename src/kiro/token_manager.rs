@@ -1027,25 +1027,72 @@ impl MultiTokenManager {
     /// acquire_context 拿到列表后挨个 `try_acquire_owned`，第一个抢到 permit 的就用。
     fn rank_candidates(&self, model: Option<&str>, group: Option<&str>) -> Vec<u64> {
         // 1. 过滤可用候选
-        let candidate_ids: Vec<u64> = {
+        let (candidate_ids, total_entries, enabled_count, group_matched_count, model_matched_count): (
+            Vec<u64>,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) = {
             let entries = self.entries.lock();
             let is_opus = model
                 .map(|m| m.to_lowercase().contains("opus"))
                 .unwrap_or(false);
-            entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .filter(|e| !is_opus || e.credentials.supports_opus())
+            let total_entries = entries.len();
+            let mut enabled_count = 0usize;
+            let mut group_matched_count = 0usize;
+            let mut model_matched_count = 0usize;
+            let mut candidate_ids = Vec::new();
+            for e in entries.iter() {
+                if e.disabled {
+                    continue;
+                }
+                enabled_count += 1;
                 // 分组过滤：group=Some(g) 时只选同分组的账号；None 时不限分组（全部可用）
-                .filter(|e| match group {
+                let group_ok = match group {
                     Some(g) => e.credentials.group.as_deref() == Some(g),
                     None => true,
-                })
-                .map(|e| e.id)
-                .collect()
+                };
+                if !group_ok {
+                    continue;
+                }
+                group_matched_count += 1;
+                let model_ok = !is_opus || e.credentials.supports_opus();
+                if !model_ok {
+                    continue;
+                }
+                model_matched_count += 1;
+                candidate_ids.push(e.id);
+            }
+            (
+                candidate_ids,
+                total_entries,
+                enabled_count,
+                group_matched_count,
+                model_matched_count,
+            )
         };
+        tracing::debug!(
+            model = model.unwrap_or("<none>"),
+            group = group.unwrap_or("<none>"),
+            total_credentials = total_entries,
+            enabled_credentials = enabled_count,
+            group_matched_credentials = group_matched_count,
+            model_matched_credentials = model_matched_count,
+            candidate_count = candidate_ids.len(),
+            "凭据候选过滤完成"
+        );
 
         if candidate_ids.is_empty() {
+            tracing::warn!(
+                model = model.unwrap_or("<none>"),
+                group = group.unwrap_or("<none>"),
+                total_credentials = total_entries,
+                enabled_credentials = enabled_count,
+                group_matched_credentials = group_matched_count,
+                model_matched_credentials = model_matched_count,
+                "无可用凭据候选：请检查账号是否启用、API key 分组是否匹配、模型是否被账号支持"
+            );
             return Vec::new();
         }
 
@@ -1186,6 +1233,19 @@ impl MultiTokenManager {
             }
             i = j;
         }
+        let preview = result
+            .iter()
+            .take(8)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::debug!(
+            model = model.unwrap_or("<none>"),
+            group = group.unwrap_or("<none>"),
+            candidate_count = result.len(),
+            top_candidate_ids = %preview,
+            "凭据候选排序完成"
+        );
         result
     }
 

@@ -978,6 +978,7 @@ pub async fn post_messages(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let mapped_model = conversion_result.mapped_model.clone();
     let mut conversation_state = conversion_result.conversation_state;
 
     // 多层压缩
@@ -1081,6 +1082,14 @@ pub async fn post_messages(
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
         "已构建 Kiro 请求体"
+    );
+    tracing::info!(
+        client_model = %payload.model,
+        kiro_model_id = %mapped_model,
+        conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+        request_body_bytes = request_body.len(),
+        stream = payload.stream,
+        "Anthropic 模型已映射为 Kiro 模型"
     );
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1921,6 +1930,7 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    let mapped_model = conversion_result.mapped_model.clone();
     let mut conversation_state = conversion_result.conversation_state;
 
     // 多层压缩
@@ -2024,6 +2034,14 @@ pub async fn post_messages_cc(
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
         "已构建 Kiro 请求体"
+    );
+    tracing::info!(
+        client_model = %payload.model,
+        kiro_model_id = %mapped_model,
+        conversation_id = kiro_request.conversation_state.conversation_id.as_str(),
+        request_body_bytes = request_body.len(),
+        stream = payload.stream,
+        "Anthropic 模型已映射为 Kiro 模型"
     );
     tracing::debug!("Kiro request body: {}", request_body);
 

@@ -379,6 +379,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// Anthropic 入参模型映射后的 Kiro 上游模型 ID
+    pub mapped_model: String,
     /// 压缩统计信息（仅在启用压缩时有值）
     #[allow(dead_code)]
     pub compression_stats: Option<CompressionStats>,
@@ -769,6 +771,7 @@ pub fn convert_request(
 
     Ok(ConversionResult {
         conversation_state,
+        mapped_model: model_id,
         compression_stats,
         tool_name_map,
     })
