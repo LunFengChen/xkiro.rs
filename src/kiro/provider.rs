@@ -733,6 +733,17 @@ impl KiroProvider {
                         overage_enabled,
                         overage_remaining
                     );
+                    // 正式额度 < 5.0 且超额支持但未开启 → 自动开启超额，等下轮刷新确认
+                    let overage_capable = resp.overage_capability() == Some("OVERAGE_CAPABLE");
+                    if remaining < 5.0 && overage_capable && !overage_enabled {
+                        tracing::info!(
+                            "凭据 #{} 正式额度不足（{:.2}），自动开启超额",
+                            id, remaining
+                        );
+                        if let Err(e) = tm.set_overage_status_for(id, true).await {
+                            tracing::warn!("凭据 #{} 自动开启超额失败: {}", id, e);
+                        }
+                    }
                     if exhausted {
                         tm.mark_insufficient_balance(id);
                         tracing::warn!(

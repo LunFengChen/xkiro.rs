@@ -412,6 +412,8 @@ impl AdminService {
                 Ok((id, Some(balance), _)) => {
                     let remaining = balance.remaining;
                     let overage_rem = overage_remaining(&balance);
+                    let overage_capable = balance.overage_capability.as_deref() == Some("OVERAGE_CAPABLE");
+                    let overage_enabled = balance.overage_status.as_deref() == Some("ENABLED");
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -424,6 +426,19 @@ impl AdminService {
                     }
                     self.token_manager
                         .update_balance_cache_full(id, remaining, overage_rem);
+                    // 正式额度 < 5.0 且超额支持但未开启 → 自动开启超额，等下轮刷新确认
+                    if remaining < 5.0 && overage_capable && !overage_enabled {
+                        tracing::info!(
+                            "凭据 #{} 正式额度不足（{:.2}），自动开启超额",
+                            id, remaining
+                        );
+                        let tm = self.token_manager.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tm.set_overage_status_for(id, true).await {
+                                tracing::warn!("凭据 #{} 自动开启超额失败: {}", id, e);
+                            }
+                        });
+                    }
                     // 真正不可用 = 正式额度耗尽 AND（超额未开启 OR 超额额度耗尽）
                     let exhausted = remaining < LOW_BALANCE_THRESHOLD
                         && overage_rem < LOW_BALANCE_THRESHOLD;
@@ -848,14 +863,15 @@ impl AdminService {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
-        // 导入即默认开启超额(overage)。失败不影响凭据添加(用户可后续手动开)。
-        if let Err(e) = self
-            .token_manager
-            .set_overage_status_for(credential_id, true)
-            .await
-        {
-            tracing::warn!("凭据 #{} 添加后默认开启超额失败(不影响添加): {}", credential_id, e);
-        }
+        // 不在导入时立刻开超额，避免大批账号集中变更偏好被风控识别。
+        // 正式额度耗尽时由 spawn_balance_refresh / refresh_balances_concurrent 自动开启。
+        // if let Err(e) = self
+        //     .token_manager
+        //     .set_overage_status_for(credential_id, true)
+        //     .await
+        // {
+        //     tracing::warn!("凭据 #{} 添加后默认开启超额失败(不影响添加): {}", credential_id, e);
+        // }
 
         Ok(AddCredentialResponse {
             success: true,
@@ -2499,17 +2515,17 @@ impl AdminService {
                 // validate=false：首刷失败也会入池为禁用态，交给后台定时重试。
                 // 这里据实告知用户该号是「已激活」还是「已入池待自动重试」。
                 let pending_retry = self.token_manager.is_credential_disabled(credential_id);
-                // 导入即默认开启超额(overage)。仅对激活成功的号尝试;失败不影响导入结果
-                // (上游开关失败时号照常可用,用户可后续手动开)。禁用态的号留给后台重试激活后再说。
-                if !pending_retry {
-                    if let Err(e) = self
-                        .token_manager
-                        .set_overage_status_for(credential_id, true)
-                        .await
-                    {
-                        tracing::warn!("凭据 #{} 导入后默认开启超额失败(不影响导入): {}", credential_id, e);
-                    }
-                }
+                // 不在导入时立刻开超额，避免大批账号集中变更偏好被风控识别。
+                // 正式额度耗尽时由 spawn_balance_refresh / refresh_balances_concurrent 自动开启。
+                // if !pending_retry {
+                //     if let Err(e) = self
+                //         .token_manager
+                //         .set_overage_status_for(credential_id, true)
+                //         .await
+                //     {
+                //         tracing::warn!("凭据 #{} 导入后默认开启超额失败(不影响导入): {}", credential_id, e);
+                //     }
+                // }
                 ImportItemResult {
                     index,
                     fingerprint,
